@@ -1,0 +1,5 @@
+.venv/
+.env
+
+docs/*.pdf
+docs/*.md
