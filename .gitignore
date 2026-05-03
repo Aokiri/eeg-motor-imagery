@@ -1,5 +1,5 @@
 .venv/
 .env
 
-docs/*.pdf
-docs/*.md
+data/raw/
+docs/
