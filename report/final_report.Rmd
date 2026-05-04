@@ -1,0 +1,6 @@
+<!-- 
+To reference something here (on final report), in the YAML header we just must put:
+bibliography: ../references.bib 
+Then reference with @pfurtscheller1997, @blankertz2010, etc. 
+Papers are available on arxiv.org and PLOS One
+--> 
