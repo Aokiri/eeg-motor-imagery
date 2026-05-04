@@ -1,5 +1,6 @@
-.venv/
-.env
-
 data/raw/
-docs/
+.Rhistory
+.RData
+.Rproj.user/
+*.html
+.DS_Store
