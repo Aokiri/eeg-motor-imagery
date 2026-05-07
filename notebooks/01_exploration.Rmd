@@ -1,0 +1,466 @@
+# Exploring the dataset
+
+We are working with EEG recordings from PhysioNet. 109 subjects, 64 electrodes on the scalp, each doing motor imagery tasks (imagining moving left or right hand).
+
+Before writing any pipeline, we need to do some exploration in order to understand what is inside these files and how they are structured.
+
+## Reading a single EDF file
+
+EDF is the standard format for EEG data. Let's open one file and see what we are dealing with.
+
+```{r}
+# Imports
+library(edfReader)
+library(tidyverse)
+library(tsfeatures)
+```
+
+```{r}
+# Read the EDF file metadata (channels, sampling rate, duration, etc.)
+header <- readEdfHeader("../data/raw/S001/S001R04.edf")
+str(header)
+```
+
+```{r}
+# List all 64 channel labels + annotation channel
+# to find our motor cortex electrodes
+header$sHeaders$label
+```
+
+The labels come with trailing dots as padding (`C3..`, `Fc3.`), ignore those. The relevant ones for us are C3, C4, FC3, FC4, CP3, CP4, all positioned over the motor cortex. The remaining channels capture activity from brain regions unrelated to hand movement, so including them would just introduce noise into the classification.
+
+## Raw signal
+
+Reading C3 and C4 (the two primary motor cortex electrodes) to see the full recording.
+
+```{r}
+# Read C3 and C4 signals from the EDF file
+signals <- readEdfSignals(header, signals = c("C3..", "C4.."))
+
+# Build a tidy tibble: one row per timepoint per channel
+c3 <- tibble(
+  time = seq(0, length.out = length(signals$`C3..`$signal), by = 1/160),
+  value = signals$`C3..`$signal,
+  channel = "C3"
+)
+
+c4 <- tibble(
+  time = seq(0, length.out = length(signals$`C4..`$signal), by = 1/160),
+  value = signals$`C4..`$signal,
+  channel = "C4"
+)
+
+eeg <- bind_rows(c3, c4)
+
+# Full 125-second recording: continuous signal before segmentation into trials
+ggplot(eeg, aes(x = time, y = value, color = channel)) +
+  geom_line(alpha = 0.7) +
+  labs(x = "Time (s)", y = "Amplitude (uV)",
+       title = "S001 - R04 (Motor Imagery Left/Right)") +
+  theme_minimal()
+```
+
+125 seconds of continuous EEG. Visually indistinguishable between left and right imagery, which is expected. The discriminative information (what makes a signal different from other) lives in the statistical properties of the signal, not in its raw waveform. We will extract those properties later with `tsfeatures`.
+
+```{r}
+# Read the annotation channel (event markers: T0 = rest, T1 = left, T2 = right)
+annotations <- readEdfSignals(header, signals = "EDF Annotations")
+str(annotations)
+```
+
+## Event markers
+
+The signal is continuous, but there is an annotation channel embedded in the EDF that tells us exactly when each trial starts, ends, and what type it is.
+
+```{r}
+# Extract event table: onset time, duration, and label for each trial
+events <- annotations$annotations |> as_tibble()
+events
+# How many trials of each type in this run
+events |> count(annotation)
+```
+
+15 rest periods, 8 left, 7 right in one run. Three runs per subject (R04, R08, R12) give us around 45 task trials per subject total.
+
+## Segmenting a single trial
+
+Using the event timestamps to slice the continuous recording into individual trials. Each one is a \~4.1 second window corresponding to one imagery task.
+
+```{r}
+# Channels over the motor cortex
+#(the only ones relevant for left vs right imagery)
+motor_channels <- c("C3..", "C4..", "Fc3.", "Fc4.", "Cp3.", "Cp4.")
+
+# Read all 6 channels from the EDF file
+signals_all <- readEdfSignals(header, signals = motor_channels)
+
+# Keep only task trials (T1 = left hand, T2 = right hand) and drop T0 (rest)
+task_events <- events |> filter(annotation %in% c("T1", "T2"))
+
+# Grab the first trial as an example
+trial_1 <- task_events[1, ]
+
+# Convert event times (seconds) to sample indices
+# At 160 Hz, 4.2 seconds = sample 672. +1 because R is 1-indexed (awful)
+start_idx <- round(trial_1$onset * 160) + 1
+end_idx   <- round(trial_1$end * 160)
+
+# Extract the C3 and C4 segments for this trial
+segment <- tibble(
+  time = seq(0, length.out = end_idx - start_idx + 1, by = 1/160),
+  C3 = signals_all$`C3..`$signal[start_idx:end_idx],
+  C4 = signals_all$`C4..`$signal[start_idx:end_idx]
+) |> pivot_longer(cols = c(C3, C4), names_to = "channel", values_to = "value")
+
+# What a single ~4s trial looks like across two motor cortex channels
+ggplot(segment, aes(x = time, y = value, color = channel)) +
+  geom_line() +
+  labs(
+    title = paste("Single trial -", trial_1$annotation, "(",
+                  ifelse(trial_1$annotation == "T1", "left", "right"), ")"),
+    x = "Time (s)", y = "Amplitude (uV)"
+  ) +
+  theme_minimal()
+```
+
+A single right-hand imagery trial on C3 and C4. The signal is still noisy at this resolution. The differences between left and right only show up statistically across many trials, which is precisely why we need feature extraction and a classifier on top (next step).
+
+## Extracting all trials from one subject
+
+So far we've only looked at one trial from one run. Now we process all three motor imagery runs (R04, R08, R12) for subject S001 and collect every trial into a single table.
+
+```{r}
+imagery_runs <- c("R04", "R08", "R12")
+subject <- "S001"
+all_trials <- tibble()
+trial_counter <- 1
+
+for (run in imagery_runs) {
+  filepath <- paste0("../data/raw/", subject, "/", subject, run, ".edf")
+
+  hdr <- readEdfHeader(filepath)
+  sigs <- readEdfSignals(hdr, signals = motor_channels)
+  annot <- readEdfSignals(hdr, signals = "EDF Annotations")
+
+  evts <- annot$annotations |>
+    as_tibble() |>
+    filter(annotation %in% c("T1", "T2"))
+
+  for (i in seq_len(nrow(evts))) {
+    evt <- evts[i, ]
+    s_idx <- round(evt$onset * 160) + 1
+    e_idx <- round(evt$end * 160)
+
+    # Extract all 6 motor channels for this trial
+    trial_data <- tibble(
+      subject_id = subject,
+      trial_id = trial_counter,
+      run = run,
+      label = ifelse(evt$annotation == "T1", "left", "right"),
+      channel = rep(c("C3", "C4", "FC3", "FC4", "CP3", "CP4"),
+                    each = e_idx - s_idx + 1),
+      sample = rep(seq_len(e_idx - s_idx + 1), times = 6),
+      value = c(
+        sigs$`C3..`$signal[s_idx:e_idx],
+        sigs$`C4..`$signal[s_idx:e_idx],
+        sigs$`Fc3.`$signal[s_idx:e_idx],
+        sigs$`Fc4.`$signal[s_idx:e_idx],
+        sigs$`Cp3.`$signal[s_idx:e_idx],
+        sigs$`Cp4.`$signal[s_idx:e_idx]
+      )
+    )
+
+    all_trials <- bind_rows(all_trials, trial_data)
+    trial_counter <- trial_counter + 1
+  }
+}
+
+# Quick summary
+all_trials |> distinct(trial_id, label) |> count(label)
+```
+
+Now we have every trial from S001 in a single tidy table: one row per sample per channel, with subject, trial, run, and label columns. This is the format we need before feature extraction.
+
+## Feature extraction
+
+Each trial is a time series of \~656 samples per channel. We cannot feed raw time series into a classifier directly. Instead, we compute summary statistics for each channel in each trial using `tsfeatures`: entropy, autocorrelation, trend strength, etc. This compresses each trial from 656 x 6 values into a single row of \~90 features.
+
+```{r}
+# Extract features for one trial as a test
+test_trial <- all_trials |> filter(trial_id == 1, channel == "C3")
+
+# tsfeatures expects a list of time series
+ts_input <- list(ts(test_trial$value, frequency = 160))
+features <- tsfeatures(ts_input)
+features
+```
+
+```{r}
+# Let's request a broader set of features, we need more than 7
+feature_list <- c(
+  "entropy",
+  "stability",
+  "lumpiness",
+  "crossing_points",
+  "flat_spots",
+  "hurst",
+  "acf_features",
+  "nonlinearity"
+)
+
+features <- tsfeatures(ts_input, features = feature_list)
+features
+```
+
+14 features per channel. With 6 motor cortex channels that gives us 84 features per trial, which now is a reasonable dimensionality for classification.
+
+Now we apply this to every trial across all 6 channels.
+
+```{r}
+# Extract features for all trials and channels
+# Also handles bad trials (flat signals, corrupted data)
+extract_trial_features <- function(trial_data, feature_list) {
+  result <- tryCatch({
+    trial_data |>
+      group_by(channel) |>
+      summarise(
+        features = list(tsfeatures(list(ts(value, frequency = 160)), 
+                                   features = feature_list)),
+        .groups = "drop"
+      ) |>
+      unnest(features) |>
+      pivot_wider(names_from = channel, values_from = -channel,
+                  names_glue = "{channel}_{.value}")
+  }, error = function(e) {
+    # return NULL for trials that can't be processed
+    # (zero-variance, corrupted, etc.)
+    cat("    Skipping trial (", conditionMessage(e), ")\n")
+    return(NULL)
+  })
+
+  result
+}
+
+trial_features <- all_trials |>
+  group_by(subject_id, trial_id, run, label) |>
+  group_modify(~ extract_trial_features(.x, feature_list)) |>
+  ungroup()
+
+# Check dimensions: this should be 45 rows x (4 metadata + 84 features)
+dim(trial_features)
+glimpse(trial_features)
+```
+
+45 rows (one per trial) and 88 columns: subject_id, trial_id, run, label, plus 14 features for each of the 6 channels. This is the format we need for classification.
+
+So far we've only processed S001. Now we need to scale this to all 109 subjects. This will take a while since it's reading 327 EDF files (3 runs x 109 subjects) and computing features for every trial. We save the result to CSV so we only need to run this once.
+
+```{r}
+# Process all 109 subjects
+all_subjects_features <- tibble()
+
+for (subj_num in 1:109) {
+  subject <- sprintf("S%03d", subj_num)
+  cat("Processing", subject, "\n")
+
+  subj_trials <- tibble()
+  trial_counter <- 1
+
+  for (run in imagery_runs) {
+    filepath <- paste0("../data/raw/", subject, "/", subject, run, ".edf")
+
+    # Check if some subjects might have missing files
+    if (!file.exists(filepath)) {
+      cat("  Skipping", run, "(file not found)\n")
+      next
+    }
+
+    hdr <- readEdfHeader(filepath)
+    sigs <- readEdfSignals(hdr, signals = motor_channels)
+    annot <- readEdfSignals(hdr, signals = "EDF Annotations")
+    evts <- annot$annotations |>
+      as_tibble() |>
+      filter(annotation %in% c("T1", "T2"))
+
+    for (i in seq_len(nrow(evts))) {
+      evt <- evts[i, ]
+      s_idx <- round(evt$onset * 160) + 1
+      e_idx <- round(evt$end * 160)
+
+      trial_data <- tibble(
+        channel = rep(c("C3", "C4", "FC3", "FC4", "CP3", "CP4"), 
+                      each = e_idx - s_idx + 1),
+        sample = rep(seq_len(e_idx - s_idx + 1), times = 6),
+        value = c(
+          sigs$`C3..`$signal[s_idx:e_idx],
+          sigs$`C4..`$signal[s_idx:e_idx],
+          sigs$`Fc3.`$signal[s_idx:e_idx],
+          sigs$`Fc4.`$signal[s_idx:e_idx],
+          sigs$`Cp3.`$signal[s_idx:e_idx],
+          sigs$`Cp4.`$signal[s_idx:e_idx]
+        )
+      )
+
+      features <- extract_trial_features(trial_data, feature_list)
+      features$subject_id <- subject
+      features$trial_id <- trial_counter
+      features$run <- run
+      features$label <- ifelse(evt$annotation == "T1", "left", "right")
+
+      subj_trials <- bind_rows(subj_trials, features)
+      trial_counter <- trial_counter + 1
+    }
+  }
+
+  all_subjects_features <- bind_rows(all_subjects_features, subj_trials)
+}
+
+dim(all_subjects_features)
+
+# Save so we never have to run this again...
+write_csv(all_subjects_features, "../data/processed/trial_features.csv")
+cat("Saved to data/processed/trial_features.csv\n")
+```
+
+```{r}
+dim(all_subjects_features)
+```
+
+## Resuming from S088
+
+S088 crashed the pipeline due to zero-variance channels (flat signal, likely a bad electrode). The updated `extract_trial_features` now handles these cases with `tryCatch` and skips them. Data from S001-S087 is still in memory, so we pick up where we left off.
+
+```{r}
+# Resume from S088
+for (subj_num in 88:109) {
+  subject <- sprintf("S%03d", subj_num)
+  cat("Processing", subject, "\n")
+
+  subj_trials <- tibble()
+  trial_counter <- nrow(all_subjects_features |>
+                          distinct(subject_id, trial_id)) + 1
+
+  for (run in imagery_runs) {
+    filepath <- paste0("../data/raw/", subject, "/", subject, run, ".edf")
+
+    if (!file.exists(filepath)) {
+      cat("  Skipping", run, "(file not found)\n")
+      next
+    }
+
+    hdr <- readEdfHeader(filepath)
+    sigs <- readEdfSignals(hdr, signals = motor_channels)
+    annot <- readEdfSignals(hdr, signals = "EDF Annotations")
+    evts <- annot$annotations |>
+      as_tibble() |>
+      filter(annotation %in% c("T1", "T2"))
+
+    for (i in seq_len(nrow(evts))) {
+      evt <- evts[i, ]
+      s_idx <- round(evt$onset * 160) + 1
+      e_idx <- round(evt$end * 160)
+
+      trial_data <- tibble(
+        channel = rep(c("C3", "C4", "FC3", "FC4", "CP3", "CP4"),
+                      each = e_idx - s_idx + 1),
+        sample = rep(seq_len(e_idx - s_idx + 1), times = 6),
+        value = c(
+          sigs$`C3..`$signal[s_idx:e_idx],
+          sigs$`C4..`$signal[s_idx:e_idx],
+          sigs$`Fc3.`$signal[s_idx:e_idx],
+          sigs$`Fc4.`$signal[s_idx:e_idx],
+          sigs$`Cp3.`$signal[s_idx:e_idx],
+          sigs$`Cp4.`$signal[s_idx:e_idx]
+        )
+      )
+
+      features <- extract_trial_features(trial_data, feature_list)
+
+      if (!is.null(features)) {
+        features$subject_id <- subject
+        features$trial_id <- trial_counter
+        features$run <- run
+        features$label <- ifelse(evt$annotation == "T1", "left", "right")
+        subj_trials <- bind_rows(subj_trials, features)
+      }
+
+      trial_counter <- trial_counter + 1
+    }
+  }
+
+  all_subjects_features <- bind_rows(all_subjects_features, subj_trials)
+}
+
+dim(all_subjects_features)
+
+# Check which subjects had skipped trials
+all_subjects_features |> count(subject_id) |> filter(n < 40) |> print(n = Inf)
+
+# Save
+write_csv(all_subjects_features, "../data/processed/trial_features.csv")
+cat("Saved to data/processed/trial_features.csv\n")
+```
+
+4894 trials processed across 109 subjects. S088 and S092 were fully dropped (all channels flat across all 3 runs, likely bad recordings). S100 lost some trials but kept 30. This is normal in real EEG datasets; not every recording is clean.
+
+The trial-level features are saved to `data/processed/trial_features.csv`. This is the file the classification task will use.
+
+Now we need the subject-level aggregated features for the regression task.
+
+```{r}
+# Aggregate per subject: mean and std of each feature across all their trials
+feature_cols <- all_subjects_features |>
+  select(-subject_id, -trial_id, -run, -label) |>
+  colnames()
+
+subject_features <- all_subjects_features |>
+  group_by(subject_id) |>
+  summarise(
+    across(all_of(feature_cols), list(mean = mean, std = sd),
+           .names = "{.col}_{.fn}"),
+    n_trials = n(),
+    .groups = "drop"
+  )
+
+dim(subject_features)
+
+write_csv(subject_features, "../data/processed/subject_features.csv")
+cat("Saved to data/processed/subject_features.csv\n")
+```
+
+```{r}
+# Check which subjects lost trials vs the expected ~45
+all_subjects_features |>
+  count(subject_id) |>
+  filter(n < 40) |>
+  print(n = Inf)
+```
+
+Only S100 had partial data loss (30 out of \~45 trials). Every other subject retained all their trials, that's a very good outcome! Both CSVs are now saved:
+
+- `data/processed/trial_features.csv` — one row per trial (4894 x 88), for classification
+- `data/processed/subject_features.csv` — one row per subject (109 x 170), for regression
+
+Quick sanity check on the final outputs before wrapping up.
+
+```{r}
+# Verify label balance in trial features
+all_subjects_features |> count(label)
+
+# Verify subject count and feature dimensions
+cat("Subjects:", n_distinct(subject_features$subject_id), "\n")
+# Minus subject_id and n_trials
+cat("Feature columns:", ncol(subject_features) - 2, "\n")
+
+# Preview the trial features
+all_subjects_features |>
+  select(subject_id, trial_id, label, C3_entropy,
+         C4_entropy, C3_x_acf1, C4_x_acf1) |>
+  head(10)
+```
+
+## Summary
+
+Labels are well balanced (2469 left vs 2425 right). 109 subjects, 168 aggregated features per subject. Both output CSVs are ready for the classification and regression tasks respectively.
+
+This notebook covered the full exploration: reading EDF files, understanding the event structure, segmenting trials, extracting features with `tsfeatures`, and aggregating per subject. The clean, reproducible version of this pipeline goes in `src/preprocess.R`.

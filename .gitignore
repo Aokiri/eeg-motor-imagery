@@ -1,6 +1,7 @@
 data/raw/
 .Rhistory
 .RData
-.Rproj.user/
+*.Rproj*
 *.html
 .DS_Store
+.positai
