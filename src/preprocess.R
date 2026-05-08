@@ -29,21 +29,21 @@ if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
 # Extracts features for all trials and channels
 # Also handles bad trials (flat signals, corrupted data)
-extract_trial_features <- function(trial_data, feature_list) {
+extract_trial_features <- function(trial_data, feature_list, sr = 160) {
   result <- tryCatch({
     trial_data |>
-      group_by(channel) |>
-      summarise(
-        features = list(tsfeatures(list(ts(value, frequency = sampling_rate)), 
+      group_by(channel) |>  # nolint
+      summarise(  # nolint
+        features = list(tsfeatures(list(ts(value, frequency = sr)), # nolint
                                    features = feature_list)),
         .groups = "drop"
       ) |>
-      unnest(features) |>
-      pivot_wider(names_from = channel, values_from = -channel,
+      unnest(features) |> # nolint
+      pivot_wider(names_from = channel, values_from = -channel, # nolint
                   names_glue = "{channel}_{.value}")
   }, error = function(e) {
     # Return NULL for trials that can't be processed (zero-variance, etc.)
-    return(NULL)
+    return(NULL)  # nolint
   })
   result
 }
@@ -74,9 +74,7 @@ for (subj_num in 1:109) {
     sigs  <- readEdfSignals(hdr, signals = motor_channels)
     annot <- readEdfSignals(hdr, signals = "EDF Annotations")
 
-    # The discriminative information lives
-    # in the statistical properties of the signal.
-    # Filter task trials (T1 = left hand, T2 = right hand)
+    # Filter for imagery task events only (T1 = left hand, T2 = right hand)
     evts <- annot$annotations |>
       as_tibble() |>
       filter(annotation %in% c("T1", "T2"))
@@ -103,7 +101,8 @@ for (subj_num in 1:109) {
       # Each trial is a time series of ~656 samples per channel.
       # We compute summary statistics to
       # compress it into a reasonable dimensionality.
-      features <- extract_trial_features(trial_data, feature_list)
+      features <- extract_trial_features(trial_data, feature_list,
+                                         sr = sampling_rate)
 
       if (!is.null(features)) {
         features$subject_id <- subject
