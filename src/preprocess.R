@@ -8,7 +8,7 @@ library(edfReader)
 library(tidyverse)
 library(tsfeatures)
 
-# --- Configuration --- #
+# Configuration #
 input_dir      <- "data/raw/"
 output_dir     <- "data/processed/"
 imagery_runs   <- c("R04", "R08", "R12")
@@ -25,7 +25,7 @@ feature_list <- c(
 # Ensure output directory exists
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
-# --- Helper Functions --- #
+# Helper Functions #
 
 # Extracts features for all trials and channels
 # Also handles bad trials (flat signals, corrupted data)
@@ -48,7 +48,7 @@ extract_trial_features <- function(trial_data, feature_list) {
   result
 }
 
-# --- Main Processing --- #
+# Main Processing #
 
 message("Starting processing for 109 subjects...")
 
@@ -119,7 +119,7 @@ for (subj_num in 1:109) {
   all_subjects_features <- bind_rows(all_subjects_features, subj_trials)
 }
 
-# --- Aggregation and Saving --- #
+# Aggregation and Saving #
 
 # Save trial-level features (one row per trial) for classification tasks
 message("Saving trial_features.csv...")
