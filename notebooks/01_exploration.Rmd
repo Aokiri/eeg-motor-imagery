@@ -422,6 +422,22 @@ subject_features <- all_subjects_features |>
     .groups = "drop"
   )
 
+# Compute composite stability score per subject
+std_cols <- subject_features |>
+  select(ends_with("_std")) |>
+  colnames()
+
+# Normalize each std column (z-score) then average across all of them
+stability <- subject_features |>
+  select(subject_id, all_of(std_cols)) |>
+  mutate(across(all_of(std_cols), ~ (. - mean(., na.rm = TRUE)) / sd(., na.rm = TRUE))) |>
+  rowwise() |>
+  mutate(stability_score = mean(c_across(all_of(std_cols)), na.rm = TRUE)) |>
+  ungroup() |>
+  select(subject_id, stability_score)
+
+subject_features <- subject_features |> left_join(stability, by = "subject_id")
+
 dim(subject_features)
 
 write_csv(subject_features, "../data/processed/subject_features.csv")
@@ -464,3 +480,5 @@ all_subjects_features |>
 Labels are well balanced (2469 left vs 2425 right). 109 subjects, 168 aggregated features per subject. Both output CSVs are ready for the classification and regression tasks respectively.
 
 This notebook covered the full exploration: reading EDF files, understanding the event structure, segmenting trials, extracting features with `tsfeatures`, and aggregating per subject. The clean, reproducible version of this pipeline goes in `src/preprocess.R`.
+
+TODO: Wrote down an explaination for the teacher about the Regression Task.

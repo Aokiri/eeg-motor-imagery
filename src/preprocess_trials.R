@@ -1,7 +1,8 @@
 # ==============================================================================
-# EEG Preprocessing Pipeline - PhysioNet Dataset
-# Purpose: Extract trials from EDF files and compute tsfeatures.
-# Usage: Rscript src/preprocess.R
+# EEG Preprocessing Pipeline - Trial Features
+# Purpose: Extract trials from EDF files and compute tsfeatures per trial.
+# Output:  data/processed/trial_features.csv
+# Usage:   Rscript src/preprocess_trials.R
 # ==============================================================================
 
 library(edfReader)
@@ -50,13 +51,16 @@ extract_trial_features <- function(trial_data, feature_list, sr = 160) {
 
 # Main Processing #
 
-message("Starting processing for 109 subjects...")
+n_subjects <- 109
+message("Starting processing for ", n_subjects, " subjects...")
+t_start <- proc.time()[["elapsed"]]
 
 all_subjects_features <- tibble()
 
-for (subj_num in 1:109) {
+for (subj_num in 1:n_subjects) {
   subject <- sprintf("S%03d", subj_num)
-  message("Processing ", subject, "...")
+  message(sprintf("[%3d/%d] %s ...", subj_num, n_subjects, subject))
+  t_subj <- proc.time()[["elapsed"]]
 
   subj_trials <- tibble()
   trial_counter <- 1
@@ -65,7 +69,7 @@ for (subj_num in 1:109) {
     filepath <- paste0(input_dir, subject, "/", subject, run, ".edf")
 
     if (!file.exists(filepath)) {
-      message("  Skipping ", run, " (file not found)")
+      message("         ", run, ": file not found, skipping")
       next
     }
 
@@ -116,31 +120,20 @@ for (subj_num in 1:109) {
     }
   }
   all_subjects_features <- bind_rows(all_subjects_features, subj_trials)
+
+  elapsed_subj  <- round(proc.time()[["elapsed"]] - t_subj, 1)
+  elapsed_total <- round(proc.time()[["elapsed"]] - t_start)
+  n_subj_trials <- nrow(subj_trials)
+  n_cumulative  <- nrow(all_subjects_features)
+  pct           <- round(subj_num / n_subjects * 100)
+  message(sprintf("         %d trials | cumulative: %d | %.1fs | total elapsed: %ds (%d%%)",
+                  n_subj_trials, n_cumulative, elapsed_subj, elapsed_total, pct))
 }
 
-# Aggregation and Saving #
+# Save #
 
-# Save trial-level features (one row per trial) for classification tasks
 message("Saving trial_features.csv...")
 write_csv(all_subjects_features, paste0(output_dir, "trial_features.csv"))
 
-# Aggregate per subject: mean and std of each feature across all their trials
-message("Aggregating subject-level features for regression...")
-feature_cols <- all_subjects_features |>
-  select(-subject_id, -trial_id, -run, -label) |>
-  colnames()
-
-subject_features <- all_subjects_features |>
-  group_by(subject_id) |>
-  summarise(
-    across(all_of(feature_cols), list(mean = mean, std = sd),
-           .names = "{.col}_{.fn}"),
-    n_trials = n(),
-    .groups = "drop"
-  )
-
-write_csv(subject_features, paste0(output_dir, "subject_features.csv"))
-
-message("Done. Final dataset dimensions: ", nrow(all_subjects_features),
-        " trials across ", n_distinct(all_subjects_features$subject_id),
-        " subjects.")
+message("Done. ", nrow(all_subjects_features), " trials across ",
+        n_distinct(all_subjects_features$subject_id), " subjects.")
