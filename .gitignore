@@ -5,3 +5,4 @@ data/raw/
 *.html
 .DS_Store
 .positai
+.Rproj.user
