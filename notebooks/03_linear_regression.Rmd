@@ -1,19 +1,475 @@
 ---
-title: "R Notebook"
+title: "EEG Stability Score Prediction — Linear Regression"
 output: html_notebook
 ---
 
-This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+# 1. Setup & Data Loading
 
-Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
-
-```{r}
-plot(cars)
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyverse)
+library(tidymodels)
+library(glmnet)
+library(corrplot)
+library(vip)
 ```
 
-Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+We load the processed subject features and keep only the mean EEG features alongside the target variable `stability_score`. Subjects with any missing values are removed.
 
-When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+```{r}
+subject_features <- read.csv("../data/processed/subject_features.csv")
 
-The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+reg_data <- subject_features |>
+  select(subject_id, ends_with("_mean"), stability_score) |>
+  drop_na()
 
+cat("Subjects after cleaning:", nrow(reg_data), "\n")
+cat("Number of predictors:", ncol(reg_data) - 2, "\n")
+```
+
+------------------------------------------------------------------------
+
+# 2. Exploratory Data Analysis
+
+## 2.1 Summary Statistics
+
+```{r}
+summary_df <- reg_data %>%
+  select(where(is.numeric)) %>%
+  summarise(across(everything(), list(
+    min    = ~min(., na.rm = TRUE),
+    q1     = ~quantile(., 0.25, na.rm = TRUE),
+    median = ~median(., na.rm = TRUE),
+    mean   = ~mean(., na.rm = TRUE),
+    q3     = ~quantile(., 0.75, na.rm = TRUE),
+    max    = ~max(., na.rm = TRUE),
+    sd     = ~sd(., na.rm = TRUE)
+  ))) %>%
+  pivot_longer(everything(), names_to = "metric", values_to = "value") %>%
+  separate(metric, into = c("feature", "stat"), sep = "_(?=[^_]+$)") %>%
+  pivot_wider(names_from = "stat", values_from = "value")
+
+print(summary_df, n = 90, width = Inf)
+```
+
+## 2.2 Distribution of Features
+
+Each predictor's distribution is inspected via histograms. Heavily skewed features may affect model assumptions.
+
+```{r feature-distributions, fig.width=12, fig.height=10}
+df_long <- reg_data %>%
+  select(where(is.numeric), -subject_id) %>%
+  pivot_longer(cols = everything(), names_to = "feature", values_to = "value")
+
+ggplot(df_long, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~feature, scales = "free") +
+  theme_minimal() +
+  labs(title = "Distribution of EEG Mean Features and Stability Score",
+       x = "Value", y = "Count")
+```
+
+## 2.3 Relationship Between Predictors and Stability Score
+
+Scatter plots show the marginal linear relationship between each EEG feature and the target, providing a first justification for using linear regression.
+
+```{r scatter-vs-target, fig.width=12, fig.height=10}
+reg_data %>%
+  select(where(is.numeric), -subject_id) %>%
+  pivot_longer(-stability_score, names_to = "feature", values_to = "value") %>%
+  ggplot(aes(x = value, y = stability_score)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "firebrick", linewidth = 0.8) +
+  facet_wrap(~feature, scales = "free_x") +
+  theme_minimal() +
+  labs(title = "EEG Features vs. Stability Score",
+       x = "Feature Value", y = "Stability Score")
+```
+
+## 2.4 Correlation Heatmap
+
+The correlation matrix reveals multicollinearity among predictors, which motivates the use of regularized regression (Lasso) alongside standard OLS.
+
+```{r correlation-heatmap, fig.width=10, fig.height=9}
+cor_matrix <- reg_data %>%
+  select(where(is.numeric), -subject_id) %>%
+  cor(use = "complete.obs")
+
+corrplot(cor_matrix,
+         method = "color",
+         type = "upper",
+         tl.cex = 0.7,
+         tl.col = "black",
+         col = colorRampPalette(c("#2166ac", "white", "#d6604d"))(200),
+         title = "Feature Correlation Matrix",
+         mar = c(0, 0, 1.5, 0))
+```
+
+------------------------------------------------------------------------
+
+# 3. Train / Test Split
+
+We split the data 70/30 into training and test sets. All preprocessing parameters are estimated from the training set only to avoid data leakage.
+
+```{r}
+set.seed(42)
+reg_data_split <- reg_data %>% initial_split(prop = 0.7)
+train_data <- training(reg_data_split)
+test_data  <- testing(reg_data_split)
+
+x_train_raw <- train_data %>% select(-stability_score, -subject_id)
+y_train_raw <- train_data %>% pull(stability_score)
+x_test_raw  <- test_data  %>% select(-stability_score, -subject_id)
+y_test_raw  <- test_data  %>% pull(stability_score)
+
+cat("Training set:", nrow(train_data), "subjects\n")
+cat("Test set:    ", nrow(test_data),  "subjects\n")
+```
+
+------------------------------------------------------------------------
+
+# 4. Modelling
+
+We compare four approaches to predict `stability_score` from EEG mean features.
+
+-   **Model 1 — OLS (raw data):** included as a **cautionary baseline only**. With \~52 subjects and 84 predictors (p ≫ n), OLS is severely underdetermined: it will fit the training set perfectly while being meaningless on unseen data. This is not a valid model — it is shown precisely to illustrate *why* we need regularization.
+-   **Model 2 — OLS (normalized):** the same underdetermined model after z-score normalization. Predictive performance is identical (normalization does not change OLS fit), but the scale-equalized coefficients make the overfitting pattern even more visible. Also kept as a demonstration, not a competing model.
+-   **Model 3 — Lasso:** regularized linear regression fitted via **tidymodels**. The penalty λ is selected by 10-fold cross-validation. Lasso shrinks irrelevant coefficients to exactly zero, performing automatic feature selection and avoiding the overfit problem above.
+-   **Model 4 — Random Forest:** a non-linear ensemble method included as the non-linear alternative to Lasso, fitted via **tidymodels** with default hyperparameters.
+
+```{r}
+rmse_fn <- function(actual, predicted) sqrt(mean((actual - predicted)^2, na.rm = TRUE))
+r2_fn   <- function(actual, predicted) cor(actual, predicted)^2
+```
+
+```{r}
+# Remove subject_id once — all model chunks use these data frames
+train_model_data <- train_data %>% select(-subject_id)
+test_model_data  <- test_data  %>% select(-subject_id)
+
+# 10-fold CV folds for Lasso penalty tuning
+set.seed(42)
+cv_folds <- vfold_cv(train_model_data, v = 10)
+```
+
+## 4.1 Model 1: OLS on Raw Data
+
+> **Demonstration only.** With more predictors than subjects (p ≫ n), OLS has infinitely many solutions and will memorize the training set. The purpose here is to show the overfit signature (train R² ≈ 1, test performance collapses) that motivates regularization.
+
+```{r}
+model_raw <- lm(y_train_raw ~ ., data = x_train_raw)
+
+pred_raw_train <- predict(model_raw, newdata = x_train_raw)
+pred_raw_test  <- predict(model_raw, newdata = x_test_raw)
+
+metrics_raw <- data.frame(
+  Model   = "OLS (Raw)",
+  Dataset = c("Train", "Test"),
+  RMSE    = c(rmse_fn(y_train_raw, pred_raw_train), rmse_fn(y_test_raw, pred_raw_test)),
+  R2      = c(r2_fn(y_train_raw,   pred_raw_train), r2_fn(y_test_raw,   pred_raw_test))
+)
+
+print(metrics_raw)
+```
+
+## 4.2 Model 2: OLS on Normalized Data
+
+> **Demonstration only.** Z-score normalization does not fix the p ≫ n problem — train and test metrics are identical to Model 1 (modulo numerical precision). The value here is pedagogical: with standardized coefficients, the magnitude of overfit is more legible.
+
+Z-score normalization is applied using training set statistics only to prevent data leakage.
+
+```{r}
+train_means <- x_train_raw %>% summarise(across(everything(), ~mean(.x, na.rm = TRUE)))
+train_sds   <- x_train_raw %>% summarise(across(everything(), ~sd(.x, na.rm = TRUE)))
+
+normalize <- function(data, means, sds) {
+  data %>% mutate(across(everything(), ~(.x - means[[cur_column()]]) / sds[[cur_column()]]))
+}
+
+x_train_norm <- normalize(x_train_raw, train_means, train_sds)
+x_test_norm  <- normalize(x_test_raw,  train_means, train_sds)
+
+# Remove zero-variance columns (would produce NaN after normalization)
+zero_var <- names(x_train_norm)[sapply(x_train_norm, function(x) sd(x, na.rm = TRUE) == 0)]
+if (length(zero_var) > 0) {
+  cat("Removing zero-variance columns:", paste(zero_var, collapse = ", "), "\n")
+  x_train_norm <- x_train_norm %>% select(-all_of(zero_var))
+  x_test_norm  <- x_test_norm  %>% select(-all_of(zero_var))
+}
+
+model_norm <- lm(y_train_raw ~ ., data = x_train_norm)
+
+pred_norm_train <- predict(model_norm, newdata = x_train_norm)
+pred_norm_test  <- predict(model_norm, newdata = x_test_norm)
+
+metrics_norm <- data.frame(
+  Model   = "OLS (Normalized)",
+  Dataset = c("Train", "Test"),
+  RMSE    = c(rmse_fn(y_train_raw, pred_norm_train), rmse_fn(y_test_raw, pred_norm_test)),
+  R2      = c(r2_fn(y_train_raw,   pred_norm_train), r2_fn(y_test_raw,   pred_norm_test))
+)
+
+print(metrics_norm)
+```
+
+## 4.3 Model 3: Lasso Regression
+
+Lasso penalizes large coefficients and shrinks irrelevant predictors to exactly zero, solving the p ≫ n problem that breaks OLS. We use a **tidymodels** workflow: a recipe handles z-score normalization, and the penalty λ is selected via 10-fold cross-validation.
+
+```{r}
+# --- Recipe: normalize all predictors (fit on train only, applied to test) ---
+lasso_recipe <- recipe(stability_score ~ ., data = train_model_data) %>%
+  step_normalize(all_predictors())
+
+# --- Model spec: Lasso (mixture = 1) with tunable penalty ---
+lasso_spec <- linear_reg(penalty = tune(), mixture = 1) %>%
+  set_engine("glmnet")
+
+# --- Workflow ---
+lasso_wf <- workflow() %>%
+  add_recipe(lasso_recipe) %>%
+  add_model(lasso_spec)
+
+# --- Tune: 50-point log-scale grid ---
+lambda_grid <- grid_regular(penalty(), levels = 50)
+
+set.seed(42)
+lasso_tune <- tune_grid(
+  lasso_wf,
+  resamples = cv_folds,
+  grid      = lambda_grid,
+  metrics   = metric_set(rmse, rsq)
+)
+
+# --- Select best lambda by CV RMSE ---
+best_lambda <- select_best(lasso_tune, metric = "rmse")
+cat("Best lambda:", round(best_lambda$penalty, 6), "\n")
+
+# --- Finalize workflow and fit on full training set ---
+lasso_final <- finalize_workflow(lasso_wf, best_lambda)
+lasso_fit   <- fit(lasso_final, data = train_model_data)
+
+# --- Predict ---
+pred_lasso_train <- predict(lasso_fit, new_data = train_model_data)$.pred
+pred_lasso_test  <- predict(lasso_fit, new_data = test_model_data)$.pred
+
+# --- Metrics ---
+metrics_lasso <- data.frame(
+  Model   = "Lasso",
+  Dataset = c("Train", "Test"),
+  RMSE    = c(rmse_fn(y_train_raw, pred_lasso_train), rmse_fn(y_test_raw, pred_lasso_test)),
+  R2      = c(r2_fn(y_train_raw,   pred_lasso_train), r2_fn(y_test_raw,   pred_lasso_test))
+)
+
+print(metrics_lasso)
+
+# --- Features selected ---
+lasso_coef_tidy <- lasso_fit %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  filter(term != "(Intercept)")
+
+n_selected <- sum(lasso_coef_tidy$estimate != 0)
+cat("\nLasso selected", n_selected, "features out of", ncol(x_train_raw), "\n")
+```
+
+## 4.4 Model 4: Random Forest
+
+Random Forest is the non-linear alternative to Lasso. It makes no linearity assumption and handles correlated predictors naturally. We use a **tidymodels** workflow with default hyperparameters.
+
+```{r}
+rf_spec <- rand_forest(mode = "regression") %>%
+  set_engine("randomForest")
+
+rf_wf <- workflow() %>%
+  add_recipe(recipe(stability_score ~ ., data = train_model_data)) %>%
+  add_model(rf_spec)
+
+set.seed(42)
+rf_fit <- fit(rf_wf, data = train_model_data)
+
+pred_rf_train <- predict(rf_fit, new_data = train_model_data)$.pred
+pred_rf_test  <- predict(rf_fit, new_data = test_model_data)$.pred
+
+metrics_rf <- data.frame(
+  Model   = "Random Forest",
+  Dataset = c("Train", "Test"),
+  RMSE    = c(rmse_fn(y_train_raw, pred_rf_train), rmse_fn(y_test_raw, pred_rf_test)),
+  R2      = c(r2_fn(y_train_raw,   pred_rf_train), r2_fn(y_test_raw,   pred_rf_test))
+)
+
+print(metrics_rf)
+```
+
+------------------------------------------------------------------------
+
+# 5. Model Comparison
+
+## 5.1 Unified Metrics Table
+
+The OLS models are included for reference only. The meaningful comparison is Lasso vs. Random Forest on the test set.
+
+```{r}
+all_metrics <- rbind(metrics_raw, metrics_norm, metrics_lasso, metrics_rf)
+all_metrics <- all_metrics %>% mutate(across(where(is.numeric), ~round(., 4)))
+print(all_metrics)
+```
+
+## 5.2 Predicted vs. Actual (Lasso & Random Forest — Test Set)
+
+Points close to the diagonal indicate accurate predictions.
+
+```{r pred-vs-actual, fig.width=10, fig.height=5}
+bind_rows(
+  data.frame(actual = y_test_raw, predicted = pred_lasso_test, Model = "Lasso"),
+  data.frame(actual = y_test_raw, predicted = pred_rf_test,    Model = "Random Forest")
+) %>%
+  ggplot(aes(x = actual, y = predicted, color = Model)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(slope = 1, intercept = 0, color = "black", linetype = "dashed") +
+  facet_wrap(~Model) +
+  scale_color_manual(values = c("Lasso" = "steelblue", "Random Forest" = "darkorange")) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(title = "Predicted vs. Actual Stability Score (Test Set)",
+       x = "Actual Stability Score",
+       y = "Predicted Stability Score")
+```
+
+------------------------------------------------------------------------
+
+# 6. Model Diagnostics (Lasso)
+
+Regression diagnostics are run on the **Lasso model**, which is the actual linear model of interest. Running these on the OLS normalized model would be uninformative: with p ≫ n, OLS perfectly interpolates the training set, leaving residuals of essentially zero.
+
+## 6.1 Residuals vs. Fitted
+
+Residuals should be randomly scattered around zero with no systematic pattern. A funnel shape would indicate heteroscedasticity; a curve would suggest the linear model is missing non-linear structure.
+
+```{r residuals-vs-fitted, fig.width=7, fig.height=5}
+resid_df <- data.frame(
+  fitted    = pred_lasso_train,
+  residuals = y_train_raw - pred_lasso_train
+)
+
+ggplot(resid_df, aes(x = fitted, y = residuals)) +
+  geom_point(alpha = 0.6, color = "steelblue") +
+  geom_hline(yintercept = 0, color = "firebrick", linetype = "dashed") +
+  geom_smooth(method = "loess", se = FALSE, color = "orange", linewidth = 0.8) +
+  theme_minimal() +
+  labs(title = "Residuals vs. Fitted Values (Lasso — Train Set)",
+       x = "Fitted Values", y = "Residuals")
+```
+
+## 6.2 Q-Q Plot of Residuals
+
+If residuals are approximately normally distributed, the points should lie closely along the diagonal. Systematic departures suggest the error distribution is non-Gaussian, which can affect inference even though it does not directly affect Lasso predictions.
+
+```{r qq-plot, fig.width=6, fig.height=5}
+ggplot(resid_df, aes(sample = residuals)) +
+  stat_qq(color = "steelblue", alpha = 0.7) +
+  stat_qq_line(color = "firebrick", linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Q-Q Plot of Residuals (Lasso — Train Set)",
+       x = "Theoretical Quantiles", y = "Sample Quantiles")
+```
+
+------------------------------------------------------------------------
+
+# 7. Feature Importance — Lasso Selected Features
+
+Lasso shrinks irrelevant coefficients to exactly zero. The plot below shows only the features retained by the model, ranked by their effect on `stability_score`.
+
+```{r lasso-coef-plot, fig.width=8, fig.height=6}
+lasso_coef_df <- lasso_fit %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  filter(term != "(Intercept)", estimate != 0) %>%
+  arrange(desc(abs(estimate)))
+
+ggplot(lasso_coef_df, aes(x = reorder(term, estimate), y = estimate,
+                           fill = estimate > 0)) +
+  geom_col() +
+  scale_fill_manual(values = c("TRUE" = "steelblue", "FALSE" = "firebrick"),
+                    labels = c("TRUE" = "Positive", "FALSE" = "Negative")) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Lasso Selected Features and Their Coefficients",
+       x = "Feature", y = "Coefficient Estimate", fill = "Direction")
+```
+
+------------------------------------------------------------------------
+
+# 8. Feature Importance — Random Forest
+
+Random Forest does not produce coefficients, but it records how much each predictor reduces impurity across all trees. The `vip` package extracts these importance scores from the fitted engine.
+
+```{r rf-importance, fig.width=8, fig.height=6}
+rf_fit |>
+  extract_fit_engine() |>
+  vip(num_features = 20, aesthetics = list(fill = "steelblue", color = "white")) +
+  theme_minimal() +
+  labs(title = "Random Forest — Top 20 Feature Importances",
+       x = "Feature", y = "Importance (Mean Decrease in Node Impurity)")
+```
+
+## 8.1 Lasso vs. Random Forest: Feature Agreement
+
+```{r}
+# Lasso selected features
+lasso_selected <- lasso_coef_df %>%
+  transmute(
+    Feature = term,
+    Lasso_Coef = round(estimate, 4)
+  )
+
+n_lasso <- nrow(lasso_selected)
+
+# RF top-N importance
+rf_vi <- rf_fit %>%
+  extract_fit_engine() %>%
+  vip::vi() %>%
+  transmute(
+    Feature = Variable,
+    RF_Rank = row_number()
+  )
+
+# Join and compare
+comparison_df <- lasso_selected %>%
+  left_join(rf_vi, by = "Feature") %>%
+  mutate(
+    RF_Agrees = ifelse(
+      !is.na(RF_Rank) & RF_Rank <= n_lasso,
+      "YES",
+      "NO"
+    )
+  ) %>%
+  arrange(desc(abs(Lasso_Coef)))
+
+cat(sprintf(
+  "Lasso kept %d features | RF agrees on %d (top-%d overlap)\n\n",
+  n_lasso,
+  sum(comparison_df$RF_Agrees == "Yes"),
+  n_lasso
+))
+
+print(comparison_df)
+```
+
+------------------------------------------------------------------------
+
+# 9. Summary and Conclusion
+
+```{r}
+test_metrics <- all_metrics %>%
+  filter(Dataset == "Test") %>%
+  filter(Model == "Random Forest" | Model == "Lasso")%>%
+  arrange(RMSE) %>%
+  mutate(across(where(is.numeric), ~round(., 4)))
+
+print(test_metrics)
+```
+
+The two OLS models are not meaningful competitors — with p ≫ n they memorize the training set perfectly and fail on unseen data. The real comparison is **Lasso vs. Random Forest**. Lasso provides a sparse linear model with automatic feature selection; Random Forest captures non-linear structure and interactions without any explicit selection step.
+
+The features where both models agree — where Lasso assigns a non-zero coefficient *and* RF ranks the same feature in its top-N — are the strongest candidates for a genuine EEG stability signature. That convergence across two completely different selection mechanisms (coefficient shrinkage vs. node impurity) is hard to explain by noise alone. Features that Lasso kept but RF ranks lower likely have a clean linear relationship with stability that gets diluted inside the ensemble; features RF ranks highly that Lasso dropped point to non-linear effects or interactions a penalized linear model cannot represent. If RF outperforms Lasso on the test set, those disagreements are the most likely explanation.
