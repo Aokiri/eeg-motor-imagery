@@ -13,6 +13,8 @@ EDF is the standard format for EEG data. Let's open one file and see what we are
 library(edfReader)
 library(tidyverse)
 library(tsfeatures)
+library(signal)
+filter <- dplyr::filter
 ```
 
 ```{r}
@@ -253,6 +255,79 @@ glimpse(trial_features)
 
 45 rows (one per trial) and 88 columns: subject_id, trial_id, run, label, plus 14 features for each of the 6 channels. This is the format we need for classification.
 
+## Band power features
+
+The tsfeatures above operate on the raw broadband signal. For motor imagery, what actually discriminates left from right is the power in two specific frequency bands: mu (8–13 Hz) and beta (13–30 Hz). During imagined movement, power in these bands drops in the motor cortex contralateral to the movement — a phenomenon called event-related desynchronization (ERD). A classifier that cannot see band-specific power is missing the most informative part of the signal.
+
+To extract band power we apply a 4th-order Butterworth bandpass filter and then compute the log-variance of the filtered signal. Log-variance is standard here because it compresses the dynamic range and tends to be more normally distributed than raw variance.
+
+```{r}
+
+# Returns log(var()) of the signal filtered to [low, high] Hz
+compute_band_power <- function(x, low, high, sr = 160) {
+  nyq      <- sr / 2
+  bf       <- butter(4, c(low, high) / nyq, type = "pass")
+  filtered <- tryCatch(filtfilt(bf, x),
+                       error = function(e) rep(NA_real_, length(x)))
+  v <- var(filtered, na.rm = TRUE)
+  if (is.na(v) || v <= 0) return(NA_real_)
+  log(v)
+}
+```
+
+```{r}
+# Verify on trial 1, C3 channel
+c3_signal <- all_trials |> filter(trial_id == 1, channel == "C3") |> pull(value)
+
+mu_power   <- compute_band_power(c3_signal, 8, 13)
+beta_power <- compute_band_power(c3_signal, 13, 30)
+
+cat("C3 mu power (log-var):  ", round(mu_power, 4), "\n")
+cat("C3 beta power (log-var):", round(beta_power, 4), "\n")
+```
+
+```{r}
+# Visualize the filtered signals to confirm the filter works as expected
+nyq <- 160 / 2
+c3_mu   <- filtfilt(butter(4, c(8, 13)  / nyq, type = "pass"), c3_signal)
+c3_beta <- filtfilt(butter(4, c(13, 30) / nyq, type = "pass"), c3_signal)
+
+t <- seq(0, length.out = length(c3_signal), by = 1 / 160)
+
+bind_rows(
+  tibble(time = t, value = c3_signal, band = "broadband"),
+  tibble(time = t, value = c3_mu,     band = "mu (8-13 Hz)"),
+  tibble(time = t, value = c3_beta,   band = "beta (13-30 Hz)")
+) |>
+  ggplot(aes(x = time, y = value)) +
+  geom_line(linewidth = 0.4) +
+  facet_wrap(~band, ncol = 1, scales = "free_y") +
+  labs(x = "Time (s)", y = "Amplitude (uV)",
+       title = "Trial 1 - C3: broadband vs filtered bands") +
+  theme_minimal()
+```
+
+```{r}
+# Extract band power features for all channels in one trial
+extract_band_power_features <- function(trial_data, sr = 160) {
+  trial_data |>
+    group_by(channel) |>
+    summarise(
+      mu_power   = compute_band_power(value, 8,  13, sr),
+      beta_power = compute_band_power(value, 13, 30, sr),
+      .groups = "drop"
+    ) |>
+    pivot_wider(names_from  = channel,
+                values_from = c(mu_power, beta_power),
+                names_glue  = "{channel}_{.value}")
+}
+
+trial_1_data <- all_trials |> filter(trial_id == 1)
+extract_band_power_features(trial_1_data)
+```
+
+12 columns: mu and beta power for each of the 6 channels. These get appended to the tsfeatures row for each trial, bringing the total to 100 features per trial.
+
 So far we've only processed S001. Now we need to scale this to all 109 subjects. This will take a while since it's reading 327 EDF files (3 runs x 109 subjects) and computing features for every trial. We save the result to CSV so we only need to run this once.
 
 ```{r}
@@ -288,7 +363,7 @@ for (subj_num in 1:109) {
       e_idx <- round(evt$end * 160)
 
       trial_data <- tibble(
-        channel = rep(c("C3", "C4", "FC3", "FC4", "CP3", "CP4"), 
+        channel = rep(c("C3", "C4", "FC3", "FC4", "CP3", "CP4"),
                       each = e_idx - s_idx + 1),
         sample = rep(seq_len(e_idx - s_idx + 1), times = 6),
         value = c(
@@ -302,12 +377,18 @@ for (subj_num in 1:109) {
       )
 
       features <- extract_trial_features(trial_data, feature_list)
-      features$subject_id <- subject
-      features$trial_id <- trial_counter
-      features$run <- run
-      features$label <- ifelse(evt$annotation == "T1", "left", "right")
 
-      subj_trials <- bind_rows(subj_trials, features)
+      if (!is.null(features)) {
+        band_features <- extract_band_power_features(trial_data)
+        features <- bind_cols(features, band_features)
+
+        features$subject_id <- subject
+        features$trial_id <- trial_counter
+        features$run <- run
+        features$label <- ifelse(evt$annotation == "T1", "left", "right")
+
+        subj_trials <- bind_rows(subj_trials, features)
+      }
       trial_counter <- trial_counter + 1
     }
   }
@@ -327,6 +408,8 @@ dim(all_subjects_features)
 ```
 
 ## Resuming from S088
+
+> **Note:** This section documents a crash recovery during the original exploration session. Do not re-run: the full pipeline above already covers all 109 subjects with the updated feature set.
 
 S088 crashed the pipeline due to zero-variance channels (flat signal, likely a bad electrode). The updated `extract_trial_features` now handles these cases with `tryCatch` and skips them. Data from S001-S087 is still in memory, so we pick up where we left off.
 
@@ -454,8 +537,8 @@ all_subjects_features |>
 
 Only S100 had partial data loss (30 out of \~45 trials). Every other subject retained all their trials, that's a very good outcome! Both CSVs are now saved:
 
-- `data/processed/trial_features.csv` — one row per trial (4894 x 88), for classification
-- `data/processed/subject_features.csv` — one row per subject (109 x 170), for regression
+- `data/processed/trial_features.csv` — one row per trial (4894 x 100), for classification: 84 tsfeatures + 12 band power features (mu and beta per channel) + 4 metadata columns
+- `data/processed/subject_features.csv` — one row per subject (109 x 194), for regression: mean + std per feature, n_trials, stability_score
 
 Quick sanity check on the final outputs before wrapping up.
 
@@ -480,5 +563,3 @@ all_subjects_features |>
 Labels are well balanced (2469 left vs 2425 right). 109 subjects, 168 aggregated features per subject. Both output CSVs are ready for the classification and regression tasks respectively.
 
 This notebook covered the full exploration: reading EDF files, understanding the event structure, segmenting trials, extracting features with `tsfeatures`, and aggregating per subject. The clean, reproducible version of this pipeline goes in `src/preprocess.R`.
-
-TODO: Wrote down an explaination for the teacher about the Regression Task.
