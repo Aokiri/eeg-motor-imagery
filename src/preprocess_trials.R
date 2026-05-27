@@ -1,6 +1,7 @@
 # ==============================================================================
 # EEG Preprocessing Pipeline - Trial Features
-# Purpose: Extract trials from EDF files and compute tsfeatures per trial.
+# Purpose: Extract trials from EDF files and compute tsfeatures + band power
+#          features (mu 8-13 Hz, beta 13-30 Hz) per trial.
 # Output:  data/processed/trial_features.csv
 # Usage:   Rscript src/preprocess_trials.R
 # ==============================================================================
@@ -8,6 +9,8 @@
 library(edfReader)
 library(tidyverse)
 library(tsfeatures)
+library(signal)
+filter <- dplyr::filter
 
 # Configuration #
 input_dir      <- "data/raw/"
@@ -27,6 +30,32 @@ feature_list <- c(
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
 # Helper Functions #
+
+# Returns log(var()) of the signal filtered to [low, high] Hz.
+# Returns NA if the signal is flat or the filter fails.
+compute_band_power <- function(x, low, high, sr = 160) {
+  nyq      <- sr / 2
+  bf       <- butter(4, c(low, high) / nyq, type = "pass")
+  filtered <- tryCatch(filtfilt(bf, x),
+                       error = function(e) rep(NA_real_, length(x)))
+  v <- var(filtered, na.rm = TRUE)
+  if (is.na(v) || v <= 0) return(NA_real_)
+  log(v)
+}
+
+# Extracts mu (8-13 Hz) and beta (13-30 Hz) band power for all channels.
+extract_band_power_features <- function(trial_data, sr = 160) {
+  trial_data |>
+    group_by(channel) |>  # nolint
+    summarise(  # nolint
+      mu_power   = compute_band_power(value, 8,  13, sr),
+      beta_power = compute_band_power(value, 13, 30, sr),
+      .groups = "drop"
+    ) |>
+    pivot_wider(names_from  = channel,  # nolint
+                values_from = c(mu_power, beta_power),
+                names_glue  = "{channel}_{.value}")
+}
 
 # Extracts features for all trials and channels
 # Also handles bad trials (flat signals, corrupted data)
@@ -109,6 +138,10 @@ for (subj_num in 1:n_subjects) {
                                          sr = sampling_rate)
 
       if (!is.null(features)) {
+        band_features <- extract_band_power_features(trial_data,
+                                                     sr = sampling_rate)
+        features <- bind_cols(features, band_features)
+
         features$subject_id <- subject
         features$trial_id   <- paste0(subject, "_", trial_counter)
         features$run        <- run
