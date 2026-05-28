@@ -34,10 +34,14 @@ subject_features <- all_subjects_features |>
 message("  -> ", nrow(subject_features), " subjects, ",
         ncol(subject_features), " columns")
 
-# Compute composite stability score per subject
+# Compute composite stability score per subject.
+# Only tsfeature _std columns are used: band power and ERD stds measure
+# variability in the task/rest response, not in the intrinsic signal properties,
+# so including them would dilute the target definition.
 message("Computing stability scores...")
 std_cols <- subject_features |>
   select(ends_with("_std")) |>
+  select(-contains("_power_"), -contains("_erd_")) |>
   colnames()
 
 # Normalize each std column (z-score) then average across all of them
