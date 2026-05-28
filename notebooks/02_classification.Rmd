@@ -1,0 +1,231 @@
+# Classificaiton
+
+We are solving a problem of binary classification of motor imagery tasks (left/right fist) on per-trial EEG feautres (6 channels x ~15 tsfeatures). We will use multiple models to compare and discuss their performance and efficiency.
+
+We start with loading the processed dataset.
+
+```{r}
+# Imports
+library(tidyverse)
+library(tsfeatures)
+library(tidymodels)
+library(discrim)
+
+# install.packages("naivebayes") # Naive Bayes
+# install.packages("kknn") # KNN
+# install.packages("ranger") # Random Forest
+```
+
+```{r}
+# Read the trail-level features file
+features <- read_csv("data/processed/trial_features.csv")
+str(features)
+```
+
+## Feature Distributions
+
+We visualize the density distributions of the extracted features for the single electrode (`C3`), comparing the left and right classes to see the difference in distributions in the features between the two classes.
+
+```{r}
+features |>
+  select(starts_with("C3_"), label) |>
+  pivot_longer(cols = starts_with("C3_"), names_to = "feature", values_to = "value") |>
+  ggplot(aes(x = value, fill = label, color = label)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ feature, scales = "free") +
+  theme_minimal() +
+  labs(
+    title = "Density Distributions of C3 Features by Class",
+    x = "Feature Value",
+    y = "Density"
+  )
+```
+
+All features are very similar. We quantify this by comparing the distributions of the `left` and `right` classes for each `C3` feature using the KS test.
+
+```{r}
+features |>
+  select(starts_with("C3_"), label) |>
+  pivot_longer(cols = starts_with("C3_"), names_to = "feature", values_to = "value") |>
+  group_by(feature) |>
+  summarise(
+    ks_stat = ks.test(value[label == "left"], value[label == "right"])$statistic,
+    p_value = ks.test(value[label == "left"], value[label == "right"])$p.value,
+    .groups = "drop"
+  ) |>
+  arrange(p_value)
+```
+
+KS test shows significant difference being only in entropy (0.0628) and stability (0.0606) which is nonetheless still low. This suggests that individual features are not discriminative on their own.
+
+## Preprocessing 
+
+We prepare the dataset for further classification tasks keeping it identical for all models.
+
+```{r}
+# Factorize target
+features <- features |>
+  mutate(label = as.factor(label))
+
+# Splitting
+set.seed(42)
+data_split <- group_initial_split(features, group = subject_id, prop = 0.8)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# Base Recipe
+# Predict label using everything else, but exclude ID-like columns from predictors
+# We also scale features and remove highly correlated ones to stabilize models
+base_recipe <- recipe(label ~ ., data = train_data) |>
+  update_role(subject_id, trial_id, run, new_role = "ID") |>
+  step_impute_mean(all_numeric_predictors()) |>
+  step_zv(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_corr(all_numeric_predictors(), threshold = 0.9)
+```
+
+## Logistic Regression Baseline
+
+We build a Logistic Regression model to serve as a baseline for other non-linear models.
+
+```{r}
+# Model Specification
+logreg_spec <- logistic_reg() |>
+  set_engine("glm") |>
+  set_mode("classification")
+
+# Workflow
+logreg_wf <- workflow() |>
+  add_recipe(base_recipe) |>
+  add_model(logreg_spec)
+
+# Fitting
+logreg_fit <- logreg_wf |> fit(data = train_data)
+
+# Evaluation
+logreg_preds <- augment(logreg_fit, new_data = test_data)
+
+# Print metrics (Accuracy, Sensitivity, Specificity, ROC AUC)
+eval_metrics <- metric_set(accuracy, sensitivity, specificity, roc_auc)
+eval_metrics(logreg_preds, truth = label, estimate = .pred_class, .pred_left)
+# Confusion Matrix
+logreg_preds |>
+  conf_mat(truth = label, estimate = .pred_class)
+```
+
+As expected, logistic regression shows poor results, since the problem requires non-linear decision boundaries and complex interactions between the features.
+
+## Naive Bayes Classifier
+
+```{r}
+# Model Specification
+nb_spec <- naive_Bayes() |>
+  set_engine("naivebayes") |>
+  set_mode("classification")
+
+# Workflow
+nb_wf <- workflow() |>
+  add_recipe(base_recipe) |>
+  add_model(nb_spec)
+
+# Fitting
+nb_fit <- nb_wf |> fit(data = train_data)
+
+# Evaluation
+nb_preds <- augment(nb_fit, new_data = test_data)
+
+# Print metrics
+eval_metrics(nb_preds, truth = label, estimate = .pred_class, .pred_left)
+# Confusion Matrix
+nb_preds |>
+  conf_mat(truth = label, estimate = .pred_class)
+```
+
+## KNN Classifier
+
+```{r}
+# Model Specification
+knn_spec <- nearest_neighbor(neighbors = 10) |>
+  set_engine("kknn") |>
+  set_mode("classification")
+
+# Workflow
+knn_wf <- workflow() |>
+  add_recipe(base_recipe) |>
+  add_model(knn_spec)
+
+# Fitting
+knn_fit <- knn_wf |> fit(data = train_data)
+
+# Evaluation
+knn_preds <- augment(knn_fit, new_data = test_data)
+
+# Print metrics
+eval_metrics(knn_preds, truth = label, estimate = .pred_class, .pred_left)
+# Confusion Matrix
+knn_preds |>
+  conf_mat(truth = label, estimate = .pred_class)
+```
+
+## Random Forest Classifier
+
+```{r}
+# Model Specification
+rf_spec <- rand_forest(trees = 500) |>
+  set_engine("ranger") |>
+  set_mode("classification")
+
+# Workflow
+rf_wf <- workflow() |>
+  add_recipe(base_recipe) |>
+  add_model(rf_spec)
+
+# Fitting
+rf_fit <- rf_wf |> fit(data = train_data)
+
+# Evaluation
+rf_preds <- augment(rf_fit, new_data = test_data)
+
+# Print metrics
+eval_metrics(rf_preds, truth = label, estimate = .pred_class, .pred_left)
+# Confusion Matrix
+rf_preds |>
+  conf_mat(truth = label, estimate = .pred_class)
+```
+
+## Combined Evaluation
+
+```{r}
+# Combined ROC Curve Plot
+bind_rows(
+  logreg_preds |> mutate(model = "Logistic Regression"),
+  nb_preds |> mutate(model = "Naive Bayes"),
+  knn_preds |> mutate(model = "KNN"),
+  rf_preds |> mutate(model = "Random Forest")
+) |>
+  group_by(model) |>
+  roc_curve(truth = label, .pred_left) |>
+  autoplot() +
+  labs(title = "ROC Curves: All Models Compared")
+```
+
+```{r}
+# Print evaluation metrics and confusion matrices for all models
+models <- list(
+  "Logistic Regression" = logreg_preds,
+  "Naive Bayes" = nb_preds,
+  "KNN" = knn_preds,
+  "Random Forest" = rf_preds
+)
+
+# Combined metrics table (metrics as columns)
+metrics_tbl <- purrr::imap_dfr(models, ~ {
+  res <- eval_metrics(.x, truth = label, estimate = .pred_class, .pred_left)
+  res$model <- .y
+  res
+}) |> 
+  select(model, .metric, .estimator, .estimate) |> 
+  tidyr::pivot_wider(id_cols = model, names_from = .metric, values_from = .estimate, names_sep = "_")
+
+print(metrics_tbl)
+```
