@@ -1,0 +1,9 @@
+"Model","Dataset","RMSE","R2"
+"OLS (Raw)","Train",0,1
+"OLS (Raw)","Test",7.1156,0.0276
+"OLS (Normalized)","Train",0,1
+"OLS (Normalized)","Test",7.1156,0.0276
+"Lasso","Train",0.2558,0.6624
+"Lasso","Test",0.308,0.5363
+"Random Forest","Train",0.1282,0.9489
+"Random Forest","Test",0.2818,0.7104

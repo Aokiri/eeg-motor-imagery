@@ -1,0 +1,311 @@
+# Classificaiton
+
+We are solving a problem of binary classification of motor imagery tasks (left/right fist) on per-trial EEG feautres (6 channels x ~15 tsfeatures). We will use multiple models to compare and discuss their performance and efficiency.
+
+We start with loading the processed dataset.
+
+```{r}
+# Imports
+library(tidyverse)
+library(tsfeatures)
+library(tidymodels)
+library(discrim)
+
+# install.packages("naivebayes") # Naive Bayes
+# install.packages("kknn") # KNN
+# install.packages("ranger") # Random Forest
+```
+
+```{r}
+# Read the trail-level features file
+features <- read_csv("data/processed/trial_features.csv")
+str(features)
+```
+
+## Feature Distributions
+
+We visualize the density distributions of the extracted features for the single electrode (`C3`), comparing the left and right classes to see the difference in distributions in the features between the two classes.
+
+```{r}
+features |>
+  select(starts_with("C3_"), label) |>
+  pivot_longer(cols = starts_with("C3_"), names_to = "feature", values_to = "value") |>
+  ggplot(aes(x = value, fill = label, color = label)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ feature, scales = "free") +
+  theme_minimal() +
+  labs(
+    title = "Density Distributions of C3 Features by Class",
+    x = "Feature Value",
+    y = "Density"
+  )
+```
+
+All features are very similar. We quantify this by comparing the distributions of the `left` and `right` classes for each `C3` feature using the KS test.
+
+```{r}
+features |>
+  select(starts_with("C3_"), label) |>
+  pivot_longer(cols = starts_with("C3_"), names_to = "feature", values_to = "value") |>
+  group_by(feature) |>
+  summarise(
+    ks_stat = ks.test(value[label == "left"], value[label == "right"])$statistic,
+    p_value = ks.test(value[label == "left"], value[label == "right"])$p.value,
+    .groups = "drop"
+  ) |>
+  arrange(p_value)
+```
+
+KS test shows significant difference being only in entropy (0.0628) and stability (0.0606) which is nonetheless still low. This suggests that individual features are not discriminative on their own.
+
+## Preprocessing 
+
+We prepare the dataset for further classification tasks keeping it identical for all models.
+
+```{r}
+# Factorize target
+features <- features |>
+  mutate(label = as.factor(label))
+
+# Add lateral asymmetry features (left hemisphere - right hemisphere per band).
+# During right-hand imagery, C3 (contralateral) drops and C4 rises, so the
+# difference captures the ERD asymmetry directly without needing a rest baseline.
+features <- features |>
+  mutate(
+    asym_mu_C   = C3_mu_power    - C4_mu_power,
+    asym_beta_C = C3_beta_power  - C4_beta_power,
+    asym_mu_F   = FC3_mu_power   - FC4_mu_power,
+    asym_beta_F = FC3_beta_power - FC4_beta_power,
+    asym_mu_P   = CP3_mu_power   - CP4_mu_power,
+    asym_beta_P = CP3_beta_power - CP4_beta_power
+  )
+
+# Per-subject z-score normalization: removes between-subject amplitude differences
+# so the classifier learns relative patterns within each subject rather than
+# absolute levels that vary enormously between individuals.
+feature_cols <- features |>
+  select(-subject_id, -trial_id, -run, -label) |>
+  colnames()
+
+features <- features |>
+  group_by(subject_id) |>
+  mutate(across(all_of(feature_cols),
+                ~ (. - mean(., na.rm = TRUE)) / (sd(., na.rm = TRUE) + 1e-8))) |>
+  ungroup()
+
+# Within-subject split: every subject has trials in both train and test (80/20).
+# This evaluates how well the model generalizes to unseen trials of known subjects,
+# which is the standard BCI evaluation setting.
+set.seed(42)
+data_split <- initial_split(features, prop = 0.8, strata = subject_id)
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+# Base Recipe
+base_recipe <- recipe(label ~ ., data = train_data) |>
+  update_role(subject_id, trial_id, run, new_role = "ID") |>
+  step_impute_mean(all_numeric_predictors()) |>
+  step_zv(all_numeric_predictors()) |>
+  step_corr(all_numeric_predictors(), threshold = 0.9)
+```
+
+## Logistic Regression Baseline
+
+We build a Logistic Regression model to serve as a baseline for other non-linear models.
+
+```{r}
+# Model Specification
+logreg_spec <- logistic_reg() |>
+  set_engine("glm") |>
+  set_mode("classification")
+
+# Workflow
+logreg_wf <- workflow() |>
+  add_recipe(base_recipe) |>
+  add_model(logreg_spec)
+
+# Fitting
+logreg_fit <- logreg_wf |> fit(data = train_data)
+
+# Evaluation
+logreg_preds <- augment(logreg_fit, new_data = test_data)
+
+# Print metrics (Accuracy, Sensitivity, Specificity, ROC AUC)
+eval_metrics <- metric_set(accuracy, sensitivity, specificity, roc_auc)
+eval_metrics(logreg_preds, truth = label, estimate = .pred_class, .pred_left)
+# Confusion Matrix
+logreg_preds |>
+  conf_mat(truth = label, estimate = .pred_class)
+```
+
+As expected, logistic regression shows poor results, since the problem requires non-linear decision boundaries and complex interactions between the features.
+
+## Naive Bayes Classifier
+
+```{r}
+# Model Specification
+nb_spec <- naive_Bayes() |>
+  set_engine("naivebayes") |>
+  set_mode("classification")
+
+# Workflow
+nb_wf <- workflow() |>
+  add_recipe(base_recipe) |>
+  add_model(nb_spec)
+
+# Fitting
+nb_fit <- nb_wf |> fit(data = train_data)
+
+# Evaluation
+nb_preds <- augment(nb_fit, new_data = test_data)
+
+# Print metrics
+eval_metrics(nb_preds, truth = label, estimate = .pred_class, .pred_left)
+# Confusion Matrix
+nb_preds |>
+  conf_mat(truth = label, estimate = .pred_class)
+```
+
+## KNN Classifier
+
+```{r}
+# Model Specification
+knn_spec <- nearest_neighbor(neighbors = 10) |>
+  set_engine("kknn") |>
+  set_mode("classification")
+
+# Workflow
+knn_wf <- workflow() |>
+  add_recipe(base_recipe) |>
+  add_model(knn_spec)
+
+# Fitting
+knn_fit <- knn_wf |> fit(data = train_data)
+
+# Evaluation
+knn_preds <- augment(knn_fit, new_data = test_data)
+
+# Print metrics
+eval_metrics(knn_preds, truth = label, estimate = .pred_class, .pred_left)
+# Confusion Matrix
+knn_preds |>
+  conf_mat(truth = label, estimate = .pred_class)
+```
+
+## Random Forest Classifier
+
+```{r}
+# Model Specification
+rf_spec <- rand_forest(trees = 500) |>
+  set_engine("ranger") |>
+  set_mode("classification")
+
+# Workflow
+rf_wf <- workflow() |>
+  add_recipe(base_recipe) |>
+  add_model(rf_spec)
+
+# Fitting
+rf_fit <- rf_wf |> fit(data = train_data)
+
+# Evaluation
+rf_preds <- augment(rf_fit, new_data = test_data)
+
+# Print metrics
+eval_metrics(rf_preds, truth = label, estimate = .pred_class, .pred_left)
+# Confusion Matrix
+rf_preds |>
+  conf_mat(truth = label, estimate = .pred_class)
+```
+
+## Combined Evaluation
+
+```{r}
+# Combined ROC Curve Plot
+bind_rows(
+  logreg_preds |> mutate(model = "Logistic Regression"),
+  nb_preds |> mutate(model = "Naive Bayes"),
+  knn_preds |> mutate(model = "KNN"),
+  rf_preds |> mutate(model = "Random Forest")
+) |>
+  group_by(model) |>
+  roc_curve(truth = label, .pred_left) |>
+  autoplot() +
+  labs(title = "ROC Curves: All Models Compared")
+```
+
+```{r}
+# Print evaluation metrics and confusion matrices for all models
+models <- list(
+  "Logistic Regression" = logreg_preds,
+  "Naive Bayes" = nb_preds,
+  "KNN" = knn_preds,
+  "Random Forest" = rf_preds
+)
+
+# Combined metrics table (metrics as columns)
+metrics_tbl <- purrr::imap_dfr(models, ~ {
+  res <- eval_metrics(.x, truth = label, estimate = .pred_class, .pred_left)
+  res$model <- .y
+  res
+}) |>
+  select(model, .metric, .estimator, .estimate) |>
+  tidyr::pivot_wider(id_cols = model, names_from = .metric, values_from = .estimate, names_sep = "_")
+
+print(metrics_tbl)
+```
+
+## Per-subject accuracy
+
+The global accuracy number is the average over all subjects, but motor imagery classification is known to produce highly variable results across individuals. Some subjects show strong, consistent ERD responses ("BCI literates") while others show little to no discriminative signal ("BCI illiterates"). Reporting only the global accuracy masks this structure.
+
+We use the Random Forest predictions on the test set to compute per-subject accuracy and visualise the distribution.
+
+```{r}
+per_subject_acc <- rf_preds |>
+  group_by(subject_id) |>
+  summarise(
+    accuracy = mean(.pred_class == label),
+    n_trials = n(),
+    .groups = "drop"
+  ) |>
+  arrange(accuracy)
+
+# Sorted bar chart: one bar per subject
+ggplot(per_subject_acc, aes(x = reorder(subject_id, accuracy), y = accuracy)) +
+  geom_col(aes(fill = accuracy), show.legend = FALSE) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray40") +
+  geom_hline(yintercept = mean(per_subject_acc$accuracy),
+             linetype = "dashed", color = "steelblue") +
+  scale_fill_gradient(low = "#f28e2b", high = "#4e79a7") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = "Subject", y = "Accuracy",
+    title = "Per-subject classification accuracy (Random Forest)",
+    subtitle = "Blue dashed line = global mean | Gray dashed line = chance level (50%)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+```
+
+```{r}
+# Distribution histogram
+ggplot(per_subject_acc, aes(x = accuracy)) +
+  geom_histogram(binwidth = 0.05, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = mean(per_subject_acc$accuracy),
+             linetype = "dashed", color = "steelblue", linewidth = 0.8) +
+  geom_vline(xintercept = 0.5, linetype = "dashed",
+             color = "gray40", linewidth = 0.8) +
+  scale_x_continuous(labels = scales::percent_format()) +
+  labs(x = "Per-subject accuracy", y = "Number of subjects",
+       title = "Distribution of per-subject accuracy") +
+  theme_minimal()
+```
+
+```{r}
+cat("Global accuracy (mean over subjects):", round(mean(per_subject_acc$accuracy), 3), "\n")
+cat("Subjects above 70%:", sum(per_subject_acc$accuracy > 0.70), "/", nrow(per_subject_acc), "\n")
+cat("Subjects at or below chance (50%):", sum(per_subject_acc$accuracy <= 0.50), "/", nrow(per_subject_acc), "\n")
+```
+
+The bimodal shape of the distribution is consistent with the BCI literacy literature. A sizeable portion of subjects achieves well above chance accuracy, while another group clusters near or below 50%, indicating that the motor imagery paradigm does not produce a reliable EEG response for every individual. This variability is inherent to the dataset and is not recoverable through feature engineering or model selection alone.
