@@ -9,7 +9,11 @@ suppressPackageStartupMessages({
   library(glmnet)
 })
 
-PROJ <- "c:/Users/aland/Documents/Knowledge/Data Science & AI/Second Year/Data Science in R/02. Project"
+PROJ <- normalizePath(file.path(
+  tryCatch(dirname(normalizePath(sub("--file=", "",
+    grep("--file=", commandArgs(FALSE), value = TRUE)))),
+    error = function(e) getwd()),
+  "../.."))
 OUT  <- file.path(PROJ, "presentation/figures")
 set.seed(42)
 

@@ -1,7 +1,11 @@
 library(ggplot2)
 library(dplyr)
 
-PROJ <- "c:/Users/aland/Documents/Knowledge/Data Science & AI/Second Year/Data Science in R/02. Project"
+PROJ <- normalizePath(file.path(
+  tryCatch(dirname(normalizePath(sub("--file=", "",
+    grep("--file=", commandArgs(FALSE), value = TRUE)))),
+    error = function(e) getwd()),
+  "../.."))
 OUT  <- file.path(PROJ, "presentation/figures")
 
 df <- read.csv(file.path(OUT, "per_subject_accuracy.csv")) |>
