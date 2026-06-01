@@ -1,0 +1,20 @@
+{
+    "name": "R Project",
+    "image": "ghcr.io/rocker-org/devcontainer/tidyverse:4.5",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "REditorSupport.r",
+                "mikesali.radian",
+                "quarto.quarto"
+            ],
+            "settings": {
+                "r.useHttpgd": true // Redirects plots to a VS Code interactive tab
+            }
+        }
+    },
+    // "postCreateCommand": "Rscript -e 'if (file.exists(\"renv.lock\")) renv::restore(prompt = FALSE)'"
+    // 1. Installs the missing Linux layout package (libglpk-dev) at the OS level
+    // 2. Automatically triggers renv::restore()
+    "postCreateCommand": "sudo apt-get update && sudo apt-get install -y libglpk-dev && Rscript -e 'if (file.exists(\"renv.lock\")) renv::restore(prompt = FALSE)'"
+}
