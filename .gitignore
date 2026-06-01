@@ -2,7 +2,7 @@ data/raw/
 .Rhistory
 .RData
 *.Rproj*
-*.html
+*-presentation.html
 .DS_Store
 .positai
 .Rproj.user
