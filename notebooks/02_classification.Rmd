@@ -470,7 +470,7 @@ p_roc_box <- ggplot(per_subject_roc, aes(x = model, y = roc_auc, fill = model)) 
     y = "ROC AUC"
   )
 
-save_plot(p_acc_box, "per_subject_rocauc_by_model_boxplot.png", width = 10, height = 5)
+save_plot(p_roc_box, "per_subject_rocauc_by_model_boxplot.png", width = 10, height = 5)
 p_roc_box
 ```
 
