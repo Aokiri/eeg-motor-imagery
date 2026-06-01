@@ -5,4 +5,5 @@ data/raw/
 *-presentation.html
 .DS_Store
 .positai
-.Rproj.user
+local/
+assets/

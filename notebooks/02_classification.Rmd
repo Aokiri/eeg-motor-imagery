@@ -1,0 +1,597 @@
+# Classification
+
+We are solving a problem of binary classification of motor imagery tasks (left/right fist) on per-trial EEG feautres (6 channels x ~15 tsfeatures).
+
+EEG patterns are strongly subject-specific, and some subjects are effectively at chance-level (often described as *BCI illiteracy*). Hence, this is a *within-subject* evaluation.
+
+To improve performance with minimal complexity, we focus on features that are most directly tied to motor imagery physiology:
+
+- $\mu$ and $\beta$ band power
+- $\mu$ and $\beta$ Event-Related Desynchronization (ERD) features
+- simple left-right asymmetry features (C3 - C4, FC3 - FC4, CP3 - CP4)
+
+```{r}
+# Imports
+library(tidyverse)
+library(tsfeatures)
+library(tidymodels)
+library(discrim)
+```
+
+```{r}
+# Seed setup
+set.seed(42)
+
+# Knit directory setup
+if (basename(getwd()) == "notebooks") {
+  knitr::opts_knit$set(root.dir = normalizePath(".."))
+}
+
+# Figure setup
+img_dir <- "assets/images/classification"
+dir.create(img_dir, recursive = TRUE, showWarnings = FALSE)
+
+theme_set(theme_minimal())
+
+save_plot <- function(plot, filename, width = 8, height = 5, dpi = 300) {
+  ggsave(
+    filename = file.path(img_dir, filename),
+    plot = plot,
+    width = width,
+    height = height,
+    dpi = dpi
+  )
+}
+```
+
+```{r}
+# Read the trail-level features file
+features_raw <- read_csv("data/processed/trial_features.csv", show_col_types = FALSE)
+
+glimpse(features_raw)
+```
+
+## Cleaning
+
+We start with building a compact feature set instead of feeding *all* extracted features into a model.
+
+```{r}
+features <- features_raw |>
+  mutate(
+    C_asym_mu   = C3_mu_power    - C4_mu_power,
+    C_asym_beta = C3_beta_power  - C4_beta_power,
+    FC_asym_mu  = FC3_mu_power   - FC4_mu_power,
+    FC_asym_beta = FC3_beta_power - FC4_beta_power,
+    CP_asym_mu  = CP3_mu_power   - CP4_mu_power,
+    CP_asym_beta = CP3_beta_power - CP4_beta_power
+  )
+
+mi_feature_cols <- features |>
+  select(matches("^(C3|C4|FC3|FC4|CP3|CP4)_(mu|beta)_(power|erd)$")) |>
+  colnames()
+
+predictor_cols <- c(
+  mi_feature_cols,
+  "C_asym_mu", "C_asym_beta",
+  "FC_asym_mu", "FC_asym_beta",
+  "CP_asym_mu", "CP_asym_beta"
+)
+
+model_df <- features |>
+  select(subject_id, trial_id, run, label, all_of(predictor_cols)) |>
+  mutate(label = factor(label, levels = c("left", "right")))
+
+# Drop subjects that have NaN values
+bad_subjects <- model_df |>
+  filter(if_any(all_of(predictor_cols), is.na)) |>
+  distinct(subject_id)
+
+dropped_by_subject <- model_df |>
+  semi_join(bad_subjects, by = "subject_id") |>
+  count(subject_id, name = "rows_dropped")
+
+print(dropped_by_subject)
+
+model_df <- model_df |>
+  anti_join(bad_subjects, by = "subject_id")
+
+cat("Trials:", nrow(model_df), " Subjects:", n_distinct(model_df$subject_id), "\n")
+cat("Predictors:", length(predictor_cols), "\n")
+```
+
+## Feature Distributions
+
+We visualize the density distributions of the extracted features for the single electrode (`C3`), comparing the left and right classes to see the difference in distributions in the features between the two classes.
+
+```{r}
+p_density_c3 <- model_df |>
+  select(starts_with(c("C3_", "C4_", "C_")), label) |>
+  pivot_longer(
+    cols = -label,
+    names_to = "feature",
+    values_to = "value"
+  ) |>
+  mutate(feature = factor(feature, levels = sort(unique(feature), decreasing = TRUE))) |>
+  ggplot(aes(x = value, fill = label, color = label)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~feature, scales = "free") +
+  theme_minimal() +
+  labs(
+    title = "Density Distributions of C3 Features by Class",
+    x = "Feature Value",
+    y = "Density"
+  )
+
+p_density_c3
+ggsave(
+  filename = file.path(img_dir, "density_distributions_c3_by_class.png"),
+  plot = p_density_c3,
+  width = 12,
+  height = 8,
+  dpi = 300
+)
+```
+
+All features are very similar. We quantify this by comparing the distributions of the `left` and `right` classes for each `C3` feature using the KS test.
+
+```{r}
+model_df |>
+  select(starts_with(c("C3_", "C4_", "C_")), label) |>
+  pivot_longer(
+    cols = -label,
+    names_to = "feature",
+    values_to = "value"
+  ) |>
+  group_by(feature) |>
+  summarise(
+    ks_stat = ks.test(
+      value[label == "left"], value[label == "right"]
+    )$statistic,
+    p_value = ks.test(
+      value[label == "left"], value[label == "right"]
+    )$p.value,
+    .groups = "drop"
+  ) |>
+  arrange(p_value)
+```
+
+KS test confirm small differences in the features. This suggests that individual features are not discriminative on their own.
+
+## Preprocessing
+
+We sample 20% of trials per subject *and per class* into the test set. This keeps the split consistent with a within-subject MI evaluation and avoids test sets with only one class for a subject.
+
+```{r}
+test_keys <- model_df |>
+  group_by(subject_id, label) |>
+  slice_sample(prop = 0.2) |>
+  ungroup() |>
+  select(subject_id, trial_id)
+
+train_data <- model_df |>
+  anti_join(test_keys, by = c("subject_id", "trial_id"))
+
+test_data <- model_df |>
+  semi_join(test_keys, by = c("subject_id", "trial_id"))
+
+cat("Train:", nrow(train_data), "| Test:", nrow(test_data), "\n")
+```
+
+We standardize predictors within each subject using statistics computed on training trials only, then apply the same transform to test trials.
+
+```{r}
+fit_subject_scaler <- function(train_df, feature_cols) {
+  train_df |>
+    group_by(subject_id) |>
+    summarise(
+      across(
+        all_of(feature_cols),
+        list(
+          mean = ~ mean(.x, na.rm = TRUE),
+          sd = ~ sd(.x, na.rm = TRUE)
+        ),
+        .names = "{.col}__{.fn}"
+      ),
+      .groups = "drop"
+    )
+}
+
+transform_subject_scaler <- function(df, scaler, feature_cols, eps = 1e-8) {
+  out <- df |>
+    left_join(scaler, by = "subject_id")
+
+  for (feature in feature_cols) {
+    m <- out[[paste0(feature, "__mean")]]
+    s <- out[[paste0(feature, "__sd")]]
+    s[is.na(s) | s < eps] <- 1
+    out[[feature]] <- (out[[feature]] - m) / (s + eps)
+  }
+
+  out |>
+    select(-ends_with("__mean"), -ends_with("__sd"))
+}
+
+scaler <- fit_subject_scaler(train_data, predictor_cols)
+train_scaled <- transform_subject_scaler(train_data, scaler, predictor_cols)
+test_scaled <- transform_subject_scaler(test_data, scaler, predictor_cols)
+```
+
+We keep pipeline identical for all models and compare:
+
+- Logistic Regression (Regularized via glmnet)
+- Naive Bayes
+- KNN
+- Random Forest
+
+```{r}
+base_recipe <- recipe(label ~ ., data = train_scaled) |>
+  update_role(subject_id, trial_id, run, new_role = "ID") |>
+  step_impute_mean(all_numeric_predictors()) |>
+  step_zv(all_numeric_predictors())
+
+eval_metrics <- metric_set(accuracy, sensitivity, specificity, roc_auc)
+
+fit_and_predict <- function(
+  model_spec, 
+  recipe, 
+  train_df, 
+  test_df, 
+  resamples = NULL, 
+  grid = NULL, 
+  metrics = eval_metrics, 
+  select_metric = "roc_auc") {
+  wf <- workflow() |>
+    add_recipe(recipe) |>
+    add_model(model_spec)
+
+  params <- workflows::extract_parameter_set_dials(wf)
+
+  # No tune() params -> just fit once
+  if (nrow(params) == 0) {
+    fit <- fit(wf, data = train_df)
+    return(augment(fit, new_data = test_df))
+  }
+
+  # Has tune() params -> must tune first
+  if (is.null(resamples) || is.null(grid)) {
+    stop("This model has tune() parameters; pass `resamples` and `grid`.")
+  }
+
+  tuned <- tune::tune_grid(
+    wf,
+    resamples = resamples,
+    grid = grid,
+    metrics = metrics
+  )
+
+  best <- tune::select_best(tuned, metric = select_metric)
+
+  fit <- tune::finalize_workflow(wf, best) |>
+    fit(data = train_df)
+  augment(fit, new_data = test_df)
+}
+```
+
+## Fit models
+
+```{r}
+p <- length(predictor_cols)
+
+## Model specs (kept constant across subjects)
+
+# Regularized logistic regression via glmnet.
+logreg_spec <- logistic_reg(
+  penalty = tune(),
+  mixture = tune()
+) |>
+  set_engine("glmnet") |>
+  set_mode("classification")
+
+logreg_grid <- dials::grid_space_filling(
+  dials::penalty(range = c(-3, 0)),
+  dials::mixture(range = c(0, 1)),
+  size = 10
+)
+
+nb_spec <- naive_Bayes() |>
+  set_engine("naivebayes") |>
+  set_mode("classification")
+
+knn_spec <- nearest_neighbor(neighbors = 15) |>
+  set_engine("kknn") |>
+  set_mode("classification")
+
+rf_spec <- rand_forest(
+  trees = 500,
+  mtry = tune(),
+  min_n = tune()
+) |>
+  set_engine("ranger") |>
+  set_mode("classification")
+
+rf_grid <- dials::grid_space_filling(
+  dials::mtry(range = c(1, floor(p/2))),
+  dials::min_n(range = c(2, 5)),
+  size = 10
+)
+
+## Within-subject evaluation
+
+# For a true within-subject pipeline, we train one independent model per subject.
+# During tuning, we hold out whole experimental runs together to avoid temporal leakage.
+make_subject_folds <- function(train_df) {
+  n_runs <- n_distinct(train_df$run)
+  rsample::group_vfold_cv(train_df, v = n_runs, group = run)
+}
+
+fit_subject_models <- function(subject_train, subject_test) {
+  folds <- make_subject_folds(subject_train)
+
+  preds_logreg <- fit_and_predict(
+    logreg_spec,
+    base_recipe,
+    subject_train,
+    subject_test,
+    resamples = folds,
+    grid = logreg_grid
+  ) |>
+    mutate(model = "Logistic Regression")
+
+  preds_nb <- fit_and_predict(nb_spec, base_recipe, subject_train, subject_test) |>
+    mutate(model = "Naive Bayes")
+
+  preds_knn <- fit_and_predict(knn_spec, base_recipe, subject_train, subject_test) |>
+    mutate(model = "KNN")
+
+  preds_rf <- fit_and_predict(
+    rf_spec,
+    base_recipe,
+    subject_train,
+    subject_test,
+    resamples = folds,
+    grid = rf_grid
+  ) |>
+    mutate(model = "Random Forest")
+
+  bind_rows(preds_logreg, preds_nb, preds_knn, preds_rf)
+}
+
+subjects <- sort(unique(train_scaled$subject_id))
+# subjects <- subjects[1:5]  # a quick dev run
+
+all_preds <- purrr::map_dfr(subjects, function(sid) {
+  subject_train <- train_scaled |>
+    filter(subject_id == sid)
+  subject_test <- test_scaled |>
+    filter(subject_id == sid)
+
+  fit_subject_models(subject_train, subject_test)
+}, .progress = "Fitting subjects")
+
+pooled_metrics <- all_preds |>
+  group_by(model) |>
+  group_modify(~ eval_metrics(.x, truth = label, estimate = .pred_class, .pred_left)) |>
+  ungroup() |>
+  select(model, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate)
+
+pooled_metrics
+```
+
+We plot ROC curves of all models.
+
+```{r}
+p_roc_all_models <- all_preds |>
+  group_by(model) |>
+  roc_curve(truth = label, .pred_left) |>
+  autoplot() +
+  labs(title = "ROC curves (test set)")
+
+p_roc_all_models
+save_plot(p_roc_all_models, "roc_curves_all_models.png", width = 8, height = 6)
+```
+
+## Per-subject performance
+
+Motor imagery classification is known to produce highly variable results across individuals. Some subjects show strong, consistent ERD responses ("BCI literates") while others show little to no discriminative signal ("BCI illiterates"). Reporting only pooled/global metrics can mask this structure.
+
+The plot below shows the distribution of **per-subject accuracies** for each model.
+
+```{r}
+# per_subject_acc <- all_preds |>
+#   group_by(model, subject_id) |>
+#   summarise(
+#     accuracy = mean(.pred_class == label),
+#     n_trials = n(),
+#     .groups = "drop"
+#   )
+
+# acc_summary <- per_subject_acc |>
+#   group_by(model) |>
+#   summarise(
+#     mean_acc = mean(accuracy),
+#     median_acc = median(accuracy),
+#     above_70 = sum(accuracy > 0.70),
+#     at_or_below_50 = sum(accuracy <= 0.50),
+#     n_subjects = n(),
+#     .groups = "drop"
+#   ) |>
+#   arrange(desc(median_acc), desc(mean_acc))
+
+# acc_summary
+
+per_subject_roc <- all_preds |>
+  group_by(model, subject_id) |>
+  summarise(
+    roc_auc = yardstick::roc_auc_vec(
+      truth = label,
+      estimate = .pred_left
+    ),
+    n_trials = n(),
+    .groups = "drop"
+  )
+
+roc_summary <- per_subject_roc |>
+  group_by(model) |>
+  summarise(
+    mean_auc = mean(roc_auc),
+    median_auc = median(roc_auc),
+    above_70 = sum(roc_auc > 0.70),
+    at_or_below_50 = sum(roc_auc <= 0.50),
+    n_subjects = n(),
+    .groups = "drop"
+  ) |>
+  arrange(desc(median_auc), desc(mean_auc))
+
+roc_summary
+```
+
+```{r}
+# p_acc_box <- ggplot(per_subject_acc, aes(x = model, y = accuracy, fill = model)) +
+#   geom_boxplot(show.legend = FALSE) +
+#   geom_hline(yintercept = 0.5, linetype = "dashed") +
+#   scale_y_continuous(labels = scales::percent_format()) +
+#   labs(
+#     title = "Per-subject accuracy distribution by model",
+#     x = NULL,
+#     y = "Accuracy"
+#   )
+
+# save_plot(p_acc_box, "per_subject_accuracy_by_model_boxplot.png", width = 10, height = 5)
+# p_acc_box
+
+p_roc_box <- ggplot(per_subject_roc, aes(x = model, y = roc_auc, fill = model)) +
+  geom_boxplot(show.legend = FALSE) +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "Per-subject ROC AUC distribution by model",
+    x = NULL,
+    y = "ROC AUC"
+  )
+
+save_plot(p_roc_box, "per_subject_rocauc_by_model_boxplot.png", width = 10, height = 5)
+p_roc_box
+```
+
+## Best model analysis
+
+Even with a within-subject pipeline, performance varies widely across individuals. We pick the best model by median per-subject accuracy and visualise the distribution.
+
+We pick the best model by median per-subject accuracy to compute per-subject accuracy and visualise the distribution.
+
+```{r}
+# best_model <- acc_summary |>
+#   slice(1) |>
+#   pull(model)
+
+# cat("Best model (by median per-subject accuracy):", best_model, "\n")
+
+# best_per_subject <- per_subject_acc |>
+#   filter(model == best_model) |>
+#   arrange(accuracy)
+
+# cat("Mean per-subject accuracy:", round(mean(best_per_subject$accuracy), 3), "\n")
+# cat("Subjects above 70%:", sum(best_per_subject$accuracy > 0.70), "/", nrow(best_per_subject), "\n")
+# cat("Subjects at/below 50%:", sum(best_per_subject$accuracy <= 0.50), "/", nrow(best_per_subject), "\n")
+
+best_model <- roc_summary |>
+  slice(1) |>
+  pull(model)
+
+cat("Best model (by median per-subject ROC AUC):", best_model, "\n")
+
+best_per_subject <- per_subject_roc |>
+  filter(model == best_model) |>
+  arrange(roc_auc)
+
+cat("Mean per-subject ROC AUC:", round(mean(best_per_subject$roc_auc), 3), "\n")
+cat("Subjects above 70%:", sum(best_per_subject$roc_auc > 0.70), "/", nrow(best_per_subject), "\n")
+cat("Subjects at/below 50%:", sum(best_per_subject$roc_auc <= 0.50), "/", nrow(best_per_subject), "\n")
+```
+
+```{r}
+# p_best_bar <- ggplot(best_per_subject, aes(x = reorder(subject_id, accuracy), y = accuracy)) +
+#   geom_col(aes(fill = accuracy), show.legend = FALSE) +
+#   geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray40") +
+#   geom_hline(
+#     yintercept = mean(best_per_subject$accuracy),
+#     linetype = "dashed", color = "red"
+#   ) +
+#   scale_y_continuous(labels = scales::percent_format()) +
+#   labs(
+#     x = NULL,
+#     y = "Accuracy",
+#     title = paste0("Per-subject accuracy (", best_model, ")")
+#   ) +
+#   theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+# p_best_bar
+# save_plot(p_best_bar, "best_model_per_subject_accuracy_bar.png", width = 12, height = 5)
+
+p_best_bar <- ggplot(best_per_subject, aes(x = reorder(subject_id, roc_auc), y = roc_auc)) +
+  geom_col(aes(fill = roc_auc), show.legend = FALSE) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray40") +
+  geom_hline(
+    yintercept = mean(best_per_subject$roc_auc),
+    linetype = "dashed", color = "red"
+  ) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = NULL,
+    y = "ROC AUC",
+    title = paste0("Per-subject ROC AUC (", best_model, ")")
+  ) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+p_best_bar
+save_plot(p_best_bar, "best_model_per_subject_rocauc_bar.png", width = 12, height = 5)
+```
+
+```{r}
+# p_best_hist <- ggplot(best_per_subject, aes(x = accuracy)) +
+#   geom_histogram(binwidth = 0.05, fill = "lightblue", color = "white") +
+#   geom_vline(
+#     xintercept = mean(best_per_subject$accuracy),
+#     linetype = "dashed", color = "gray40", linewidth = 0.8
+#   ) +
+#   geom_vline(
+#     xintercept = 0.5,
+#     linetype = "dashed",
+#     color = "gray40",
+#     linewidth = 0.8
+#   ) +
+#   scale_x_continuous(labels = scales::percent_format()) +
+#   labs(
+#     x = "Per-subject accuracy",
+#     y = "Number of subjects",
+#     title = paste0("Distribution of per-subject accuracy (", best_model, ")")
+#   )
+
+# p_best_hist
+# save_plot(p_best_hist, "best_model_per_subject_accuracy_hist.png", width = 8, height = 5)
+
+p_best_hist <- ggplot(best_per_subject, aes(x = roc_auc)) +
+  geom_histogram(binwidth = 0.05, fill = "lightblue", color = "white") +
+  geom_vline(
+    xintercept = mean(best_per_subject$roc_auc),
+    linetype = "dashed", color = "gray40", linewidth = 0.8
+  ) +
+  geom_vline(
+    xintercept = 0.5,
+    linetype = "dashed",
+    color = "gray40",
+    linewidth = 0.8
+  ) +
+  scale_x_continuous(labels = scales::percent_format()) +
+  labs(
+    x = "Per-subject ROC AUC",
+    y = "Number of subjects",
+    title = paste0("Distribution of per-subject ROC AUC (", best_model, ")")
+  )
+
+p_best_hist
+save_plot(p_best_hist, "best_model_per_subject_rocauc_hist.png", width = 8, height = 5)
+```
+
+The bimodal shape of the distribution is consistent with the BCI literacy literature. A sizeable portion of subjects achieves well above chance accuracy, while another group clusters near or below 50%, indicating that the motor imagery paradigm does not produce a reliable EEG response for every individual. This variability is inherent to the dataset and is not recoverable through feature engineering or model selection.
