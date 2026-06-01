@@ -43,16 +43,17 @@ eeg-motor-imagery/
 ├── data/
 │   ├── raw/                     # EDF files from PhysioNet (not tracked)
 │   └── processed/
-│       ├── trial_features.csv   # per-trial features for classification
-│       └── subject_features.csv # per-subject aggregated features for regression
+│       ├── trial_features.csv   # per-trial features (4,894 trials × 108 features)
+│       └── subject_features.csv # per-subject aggregated features + stability_score
 ├── notebooks/
-│   ├── 01_exploration.Rmd
-│   └── 02_preprocessing.Rmd
+│   ├── 01_exploration.Rmd       # data exploration and pipeline walkthrough
+│   ├── 02_classification.Rmd   # binary classification (left vs right)
+│   └── 03_linear_regression.Rmd # regression on stability_score
 ├── src/
-│   └── preprocess.R
-├── report/
-│   └── final_report.Rmd
-├── references.bib
+│   ├── preprocess_trials.R      # EDF → trial_features.csv
+│   └── preprocess_subjects.R    # trial_features.csv → subject_features.csv
+├── presentation/
+│   └── r-presentation-dist.html
 ├── .gitignore
 └── README.md
 ```
@@ -61,8 +62,8 @@ eeg-motor-imagery/
 
 | Task | Input | Target | Models |
 |---|---|---|---|
-| Classification | Per-trial EEG features (6 channels x ~15 tsfeatures) | left / right (binary) | Logistic regression, Random forest |
-| Regression | Per-subject aggregated features (mean, std across trials) | Classification accuracy (0.5-1.0) | Linear regression, Random forest |
+| Classification | Per-trial EEG features (108 features: tsfeatures, band power, ERD, lateral asymmetry) | left / right (binary) | Logistic regression, Naive Bayes, KNN, Random Forest |
+| Regression | Per-subject mean features (108 _mean columns) | stability_score (cross-trial consistency of tsfeature stds) | OLS (demo), Lasso, Random Forest |
 
 ## Channel selection
 
