@@ -1,4 +1,5 @@
 data/raw/
+presentation/figures/
 .Rhistory
 .RData
 *.Rproj*
