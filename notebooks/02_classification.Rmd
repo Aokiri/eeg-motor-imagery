@@ -22,14 +22,13 @@ library(discrim)
 # Seed setup
 set.seed(42)
 
-# Knit directory setup
-if (basename(getwd()) == "notebooks") {
-  knitr::opts_knit$set(root.dir = normalizePath(".."))
-}
-
 # Figure setup
-img_dir <- "assets/images/classification"
+project_root <- normalizePath(if (basename(getwd()) == "notebooks") ".." else ".")
+img_dir <- file.path(project_root, "assets", "images", "classification")
 dir.create(img_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Knit directory setup
+knitr::opts_knit$set(root.dir = project_root)
 
 theme_set(theme_minimal())
 
@@ -223,11 +222,47 @@ We keep pipeline identical for all models and compare:
 - KNN
 - Random Forest
 
+To choose the PCA dimensionality more systematically, we first inspect how much variance each component explains on the training set.
+
+```{r}
+pca_prep <- recipe(label ~ ., data = train_scaled) |>
+  update_role(subject_id, trial_id, run, new_role = "ID") |>
+  step_impute_mean(all_numeric_predictors()) |>
+  step_zv(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_pca(all_numeric_predictors(), num_comp = length(predictor_cols)) |>
+  prep()
+
+pca_variance <- tidy(pca_prep, number = 4, type = "variance") |> 
+  filter(terms == "cumulative percent variance") |> 
+  mutate(cumulative_variance = value / 100)
+
+cat(
+  "Components for 80% threshold:", min(pca_variance$component[pca_variance$cumulative_variance >= 0.80]), "\n",
+  "Components for 90% threshold:", min(pca_variance$component[pca_variance$cumulative_variance >= 0.90]), "\n"
+)
+
+p_pca_variance <- ggplot(pca_variance, aes(x = component, y = cumulative_variance)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  geom_hline(yintercept = c(0.80, 0.90), linetype = "dashed", color = "gray50") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(
+    title = "PCA Cumulative Explained Variance",
+    x = "Number of Principal Components", y = "Cumulative Variance"
+  )
+
+print(p_pca_variance)
+save_plot(p_pca_variance, "pca_explained_variance.png", width = 7, height = 4)
+```
+
 ```{r}
 base_recipe <- recipe(label ~ ., data = train_scaled) |>
   update_role(subject_id, trial_id, run, new_role = "ID") |>
   step_impute_mean(all_numeric_predictors()) |>
-  step_zv(all_numeric_predictors())
+  step_zv(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_pca(all_numeric_predictors(), threshold = .8)
 
 eval_metrics <- metric_set(accuracy, sensitivity, specificity, roc_auc)
 
@@ -249,7 +284,10 @@ fit_and_predict <- function(
   # No tune() params -> just fit once
   if (nrow(params) == 0) {
     fit <- fit(wf, data = train_df)
-    return(augment(fit, new_data = test_df))
+    return(bind_rows(
+      augment(fit, new_data = train_df) |> mutate(split = "train"),
+      augment(fit, new_data = test_df) |> mutate(split = "test")
+    ))
   }
 
   # Has tune() params -> must tune first
@@ -268,15 +306,16 @@ fit_and_predict <- function(
 
   fit <- tune::finalize_workflow(wf, best) |>
     fit(data = train_df)
-  augment(fit, new_data = test_df)
+  bind_rows(
+    augment(fit, new_data = train_df) |> mutate(split = "train"),
+    augment(fit, new_data = test_df) |> mutate(split = "test")
+  )
 }
 ```
 
 ## Fit models
 
-```{r}
-p <- length(predictor_cols)
-
+```{r message=FALSE, warning=FALSE}
 ## Model specs (kept constant across subjects)
 
 # Regularized logistic regression via glmnet.
@@ -288,30 +327,44 @@ logreg_spec <- logistic_reg(
   set_mode("classification")
 
 logreg_grid <- dials::grid_space_filling(
-  dials::penalty(range = c(-3, 0)),
+  dials::penalty(range = c(-1, 2)),
   dials::mixture(range = c(0, 1)),
   size = 10
 )
 
-nb_spec <- naive_Bayes() |>
+nb_spec <- naive_Bayes(
+  Laplace = tune()
+) |>
   set_engine("naivebayes") |>
   set_mode("classification")
 
-knn_spec <- nearest_neighbor(neighbors = 15) |>
+nb_grid <- dials::grid_space_filling(
+  dials::Laplace(range = c(0.1, 5)),
+  size = 10
+)
+
+knn_spec <- nearest_neighbor(
+  neighbors = tune()
+) |>
   set_engine("kknn") |>
   set_mode("classification")
+
+knn_grid <- dials::grid_space_filling(
+  dials::neighbors(range = c(5, 15)),
+  size = 10
+)
 
 rf_spec <- rand_forest(
   trees = 500,
   mtry = tune(),
   min_n = tune()
 ) |>
-  set_engine("ranger") |>
+  set_engine("ranger", max.depth = 3) |>
   set_mode("classification")
 
 rf_grid <- dials::grid_space_filling(
-  dials::mtry(range = c(1, floor(p/2))),
-  dials::min_n(range = c(2, 5)),
+  dials::mtry(range = c(1, 3)),
+  dials::min_n(range = c(10, 20)),
   size = 10
 )
 
@@ -337,10 +390,24 @@ fit_subject_models <- function(subject_train, subject_test) {
   ) |>
     mutate(model = "Logistic Regression")
 
-  preds_nb <- fit_and_predict(nb_spec, base_recipe, subject_train, subject_test) |>
+  preds_nb <- fit_and_predict(
+    nb_spec,
+    base_recipe,
+    subject_train,
+    subject_test,
+    resamples = folds,
+    grid = nb_grid
+  ) |>
     mutate(model = "Naive Bayes")
 
-  preds_knn <- fit_and_predict(knn_spec, base_recipe, subject_train, subject_test) |>
+  preds_knn <- fit_and_predict(
+    knn_spec,
+    base_recipe,
+    subject_train,
+    subject_test,
+    resamples = folds,
+    grid = knn_grid
+  ) |>
     mutate(model = "KNN")
 
   preds_rf <- fit_and_predict(
@@ -369,11 +436,12 @@ all_preds <- purrr::map_dfr(subjects, function(sid) {
 }, .progress = "Fitting subjects")
 
 pooled_metrics <- all_preds |>
-  group_by(model) |>
+  group_by(split, model) |>
   group_modify(~ eval_metrics(.x, truth = label, estimate = .pred_class, .pred_left)) |>
   ungroup() |>
-  select(model, .metric, .estimate) |>
-  pivot_wider(names_from = .metric, values_from = .estimate)
+  select(split, model, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  arrange(split, model)
 
 pooled_metrics
 ```
@@ -381,7 +449,10 @@ pooled_metrics
 We plot ROC curves of all models.
 
 ```{r}
-p_roc_all_models <- all_preds |>
+p_test_preds <- all_preds |>
+  filter(split == "test")
+
+p_roc_all_models <- p_test_preds |>
   group_by(model) |>
   roc_curve(truth = label, .pred_left) |>
   autoplot() +
@@ -398,7 +469,7 @@ Motor imagery classification is known to produce highly variable results across 
 The plot below shows the distribution of **per-subject accuracies** for each model.
 
 ```{r}
-per_subject_roc <- all_preds |>
+per_subject_roc <- p_test_preds |>
   group_by(model, subject_id) |>
   summarise(
     roc_auc = yardstick::roc_auc_vec(
