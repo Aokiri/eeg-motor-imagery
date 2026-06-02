@@ -22,14 +22,13 @@ library(discrim)
 # Seed setup
 set.seed(42)
 
-# Knit directory setup
-if (basename(getwd()) == "notebooks") {
-  knitr::opts_knit$set(root.dir = normalizePath(".."))
-}
-
 # Figure setup
-img_dir <- "assets/images/classification"
+project_root <- normalizePath(if (basename(getwd()) == "notebooks") ".." else ".")
+img_dir <- file.path(project_root, "assets", "images", "classification")
 dir.create(img_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Knit directory setup
+knitr::opts_knit$set(root.dir = project_root)
 
 theme_set(theme_minimal())
 
@@ -223,11 +222,47 @@ We keep pipeline identical for all models and compare:
 - KNN
 - Random Forest
 
+To choose the PCA dimensionality more systematically, we first inspect how much variance each component explains on the training set.
+
+```{r}
+pca_prep <- recipe(label ~ ., data = train_scaled) |>
+  update_role(subject_id, trial_id, run, new_role = "ID") |>
+  step_impute_mean(all_numeric_predictors()) |>
+  step_zv(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_pca(all_numeric_predictors(), num_comp = length(predictor_cols)) |>
+  prep()
+
+pca_variance <- tidy(pca_prep, number = 4, type = "variance") |> 
+  filter(terms == "cumulative percent variance") |> 
+  mutate(cumulative_variance = value / 100)
+
+cat(
+  "Components for 80% threshold:", min(pca_variance$component[pca_variance$cumulative_variance >= 0.80]), "\n",
+  "Components for 90% threshold:", min(pca_variance$component[pca_variance$cumulative_variance >= 0.90]), "\n"
+)
+
+p_pca_variance <- ggplot(pca_variance, aes(x = component, y = cumulative_variance)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  geom_hline(yintercept = c(0.80, 0.90), linetype = "dashed", color = "gray50") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(
+    title = "PCA Cumulative Explained Variance",
+    x = "Number of Principal Components", y = "Cumulative Variance"
+  )
+
+print(p_pca_variance)
+save_plot(p_pca_variance, "pca_explained_variance.png", width = 7, height = 4)
+```
+
 ```{r}
 base_recipe <- recipe(label ~ ., data = train_scaled) |>
   update_role(subject_id, trial_id, run, new_role = "ID") |>
   step_impute_mean(all_numeric_predictors()) |>
-  step_zv(all_numeric_predictors())
+  step_zv(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_pca(all_numeric_predictors(), threshold = .8)
 
 eval_metrics <- metric_set(accuracy, sensitivity, specificity, roc_auc)
 
@@ -249,7 +284,10 @@ fit_and_predict <- function(
   # No tune() params -> just fit once
   if (nrow(params) == 0) {
     fit <- fit(wf, data = train_df)
-    return(augment(fit, new_data = test_df))
+    return(bind_rows(
+      augment(fit, new_data = train_df) |> mutate(split = "train"),
+      augment(fit, new_data = test_df) |> mutate(split = "test")
+    ))
   }
 
   # Has tune() params -> must tune first
@@ -268,15 +306,16 @@ fit_and_predict <- function(
 
   fit <- tune::finalize_workflow(wf, best) |>
     fit(data = train_df)
-  augment(fit, new_data = test_df)
+  bind_rows(
+    augment(fit, new_data = train_df) |> mutate(split = "train"),
+    augment(fit, new_data = test_df) |> mutate(split = "test")
+  )
 }
 ```
 
 ## Fit models
 
-```{r}
-p <- length(predictor_cols)
-
+```{r message=FALSE, warning=FALSE}
 ## Model specs (kept constant across subjects)
 
 # Regularized logistic regression via glmnet.
@@ -288,30 +327,44 @@ logreg_spec <- logistic_reg(
   set_mode("classification")
 
 logreg_grid <- dials::grid_space_filling(
-  dials::penalty(range = c(-3, 0)),
+  dials::penalty(range = c(-1, 2)),
   dials::mixture(range = c(0, 1)),
   size = 10
 )
 
-nb_spec <- naive_Bayes() |>
+nb_spec <- naive_Bayes(
+  Laplace = tune()
+) |>
   set_engine("naivebayes") |>
   set_mode("classification")
 
-knn_spec <- nearest_neighbor(neighbors = 15) |>
+nb_grid <- dials::grid_space_filling(
+  dials::Laplace(range = c(0.1, 5)),
+  size = 10
+)
+
+knn_spec <- nearest_neighbor(
+  neighbors = tune()
+) |>
   set_engine("kknn") |>
   set_mode("classification")
+
+knn_grid <- dials::grid_space_filling(
+  dials::neighbors(range = c(5, 15)),
+  size = 10
+)
 
 rf_spec <- rand_forest(
   trees = 500,
   mtry = tune(),
   min_n = tune()
 ) |>
-  set_engine("ranger") |>
+  set_engine("ranger", max.depth = 3) |>
   set_mode("classification")
 
 rf_grid <- dials::grid_space_filling(
-  dials::mtry(range = c(1, floor(p/2))),
-  dials::min_n(range = c(2, 5)),
+  dials::mtry(range = c(1, 3)),
+  dials::min_n(range = c(10, 20)),
   size = 10
 )
 
@@ -337,10 +390,24 @@ fit_subject_models <- function(subject_train, subject_test) {
   ) |>
     mutate(model = "Logistic Regression")
 
-  preds_nb <- fit_and_predict(nb_spec, base_recipe, subject_train, subject_test) |>
+  preds_nb <- fit_and_predict(
+    nb_spec,
+    base_recipe,
+    subject_train,
+    subject_test,
+    resamples = folds,
+    grid = nb_grid
+  ) |>
     mutate(model = "Naive Bayes")
 
-  preds_knn <- fit_and_predict(knn_spec, base_recipe, subject_train, subject_test) |>
+  preds_knn <- fit_and_predict(
+    knn_spec,
+    base_recipe,
+    subject_train,
+    subject_test,
+    resamples = folds,
+    grid = knn_grid
+  ) |>
     mutate(model = "KNN")
 
   preds_rf <- fit_and_predict(
@@ -369,11 +436,12 @@ all_preds <- purrr::map_dfr(subjects, function(sid) {
 }, .progress = "Fitting subjects")
 
 pooled_metrics <- all_preds |>
-  group_by(model) |>
+  group_by(split, model) |>
   group_modify(~ eval_metrics(.x, truth = label, estimate = .pred_class, .pred_left)) |>
   ungroup() |>
-  select(model, .metric, .estimate) |>
-  pivot_wider(names_from = .metric, values_from = .estimate)
+  select(split, model, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  arrange(split, model)
 
 pooled_metrics
 ```
@@ -381,7 +449,10 @@ pooled_metrics
 We plot ROC curves of all models.
 
 ```{r}
-p_roc_all_models <- all_preds |>
+p_test_preds <- all_preds |>
+  filter(split == "test")
+
+p_roc_all_models <- p_test_preds |>
   group_by(model) |>
   roc_curve(truth = label, .pred_left) |>
   autoplot() +
@@ -398,29 +469,7 @@ Motor imagery classification is known to produce highly variable results across 
 The plot below shows the distribution of **per-subject accuracies** for each model.
 
 ```{r}
-# per_subject_acc <- all_preds |>
-#   group_by(model, subject_id) |>
-#   summarise(
-#     accuracy = mean(.pred_class == label),
-#     n_trials = n(),
-#     .groups = "drop"
-#   )
-
-# acc_summary <- per_subject_acc |>
-#   group_by(model) |>
-#   summarise(
-#     mean_acc = mean(accuracy),
-#     median_acc = median(accuracy),
-#     above_70 = sum(accuracy > 0.70),
-#     at_or_below_50 = sum(accuracy <= 0.50),
-#     n_subjects = n(),
-#     .groups = "drop"
-#   ) |>
-#   arrange(desc(median_acc), desc(mean_acc))
-
-# acc_summary
-
-per_subject_roc <- all_preds |>
+per_subject_roc <- p_test_preds |>
   group_by(model, subject_id) |>
   summarise(
     roc_auc = yardstick::roc_auc_vec(
@@ -447,19 +496,6 @@ roc_summary
 ```
 
 ```{r}
-# p_acc_box <- ggplot(per_subject_acc, aes(x = model, y = accuracy, fill = model)) +
-#   geom_boxplot(show.legend = FALSE) +
-#   geom_hline(yintercept = 0.5, linetype = "dashed") +
-#   scale_y_continuous(labels = scales::percent_format()) +
-#   labs(
-#     title = "Per-subject accuracy distribution by model",
-#     x = NULL,
-#     y = "Accuracy"
-#   )
-
-# save_plot(p_acc_box, "per_subject_accuracy_by_model_boxplot.png", width = 10, height = 5)
-# p_acc_box
-
 p_roc_box <- ggplot(per_subject_roc, aes(x = model, y = roc_auc, fill = model)) +
   geom_boxplot(show.legend = FALSE) +
   geom_hline(yintercept = 0.5, linetype = "dashed") +
@@ -481,20 +517,6 @@ Even with a within-subject pipeline, performance varies widely across individual
 We pick the best model by median per-subject accuracy to compute per-subject accuracy and visualise the distribution.
 
 ```{r}
-# best_model <- acc_summary |>
-#   slice(1) |>
-#   pull(model)
-
-# cat("Best model (by median per-subject accuracy):", best_model, "\n")
-
-# best_per_subject <- per_subject_acc |>
-#   filter(model == best_model) |>
-#   arrange(accuracy)
-
-# cat("Mean per-subject accuracy:", round(mean(best_per_subject$accuracy), 3), "\n")
-# cat("Subjects above 70%:", sum(best_per_subject$accuracy > 0.70), "/", nrow(best_per_subject), "\n")
-# cat("Subjects at/below 50%:", sum(best_per_subject$accuracy <= 0.50), "/", nrow(best_per_subject), "\n")
-
 best_model <- roc_summary |>
   slice(1) |>
   pull(model)
@@ -511,24 +533,6 @@ cat("Subjects at/below 50%:", sum(best_per_subject$roc_auc <= 0.50), "/", nrow(b
 ```
 
 ```{r}
-# p_best_bar <- ggplot(best_per_subject, aes(x = reorder(subject_id, accuracy), y = accuracy)) +
-#   geom_col(aes(fill = accuracy), show.legend = FALSE) +
-#   geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray40") +
-#   geom_hline(
-#     yintercept = mean(best_per_subject$accuracy),
-#     linetype = "dashed", color = "red"
-#   ) +
-#   scale_y_continuous(labels = scales::percent_format()) +
-#   labs(
-#     x = NULL,
-#     y = "Accuracy",
-#     title = paste0("Per-subject accuracy (", best_model, ")")
-#   ) +
-#   theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
-
-# p_best_bar
-# save_plot(p_best_bar, "best_model_per_subject_accuracy_bar.png", width = 12, height = 5)
-
 p_best_bar <- ggplot(best_per_subject, aes(x = reorder(subject_id, roc_auc), y = roc_auc)) +
   geom_col(aes(fill = roc_auc), show.legend = FALSE) +
   geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray40") +
@@ -549,28 +553,6 @@ save_plot(p_best_bar, "best_model_per_subject_rocauc_bar.png", width = 12, heigh
 ```
 
 ```{r}
-# p_best_hist <- ggplot(best_per_subject, aes(x = accuracy)) +
-#   geom_histogram(binwidth = 0.05, fill = "lightblue", color = "white") +
-#   geom_vline(
-#     xintercept = mean(best_per_subject$accuracy),
-#     linetype = "dashed", color = "gray40", linewidth = 0.8
-#   ) +
-#   geom_vline(
-#     xintercept = 0.5,
-#     linetype = "dashed",
-#     color = "gray40",
-#     linewidth = 0.8
-#   ) +
-#   scale_x_continuous(labels = scales::percent_format()) +
-#   labs(
-#     x = "Per-subject accuracy",
-#     y = "Number of subjects",
-#     title = paste0("Distribution of per-subject accuracy (", best_model, ")")
-#   )
-
-# p_best_hist
-# save_plot(p_best_hist, "best_model_per_subject_accuracy_hist.png", width = 8, height = 5)
-
 p_best_hist <- ggplot(best_per_subject, aes(x = roc_auc)) +
   geom_histogram(binwidth = 0.05, fill = "lightblue", color = "white") +
   geom_vline(
