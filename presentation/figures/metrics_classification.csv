@@ -1,5 +1,0 @@
-model,accuracy,sensitivity,specificity,roc_auc
-KNN,0.5495,0.5519,0.5472,0.5771
-Logistic Regression,0.5649,0.5778,0.5519,0.5782
-Naive Bayes,0.5542,0.559,0.5495,0.5785
-Random Forest,0.5566,0.566,0.5472,0.5946
