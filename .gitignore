@@ -8,3 +8,4 @@ presentation/figures/
 .positai
 local/
 assets/
+notebooks/*.html
