@@ -398,28 +398,6 @@ Motor imagery classification is known to produce highly variable results across 
 The plot below shows the distribution of **per-subject accuracies** for each model.
 
 ```{r}
-# per_subject_acc <- all_preds |>
-#   group_by(model, subject_id) |>
-#   summarise(
-#     accuracy = mean(.pred_class == label),
-#     n_trials = n(),
-#     .groups = "drop"
-#   )
-
-# acc_summary <- per_subject_acc |>
-#   group_by(model) |>
-#   summarise(
-#     mean_acc = mean(accuracy),
-#     median_acc = median(accuracy),
-#     above_70 = sum(accuracy > 0.70),
-#     at_or_below_50 = sum(accuracy <= 0.50),
-#     n_subjects = n(),
-#     .groups = "drop"
-#   ) |>
-#   arrange(desc(median_acc), desc(mean_acc))
-
-# acc_summary
-
 per_subject_roc <- all_preds |>
   group_by(model, subject_id) |>
   summarise(
@@ -447,19 +425,6 @@ roc_summary
 ```
 
 ```{r}
-# p_acc_box <- ggplot(per_subject_acc, aes(x = model, y = accuracy, fill = model)) +
-#   geom_boxplot(show.legend = FALSE) +
-#   geom_hline(yintercept = 0.5, linetype = "dashed") +
-#   scale_y_continuous(labels = scales::percent_format()) +
-#   labs(
-#     title = "Per-subject accuracy distribution by model",
-#     x = NULL,
-#     y = "Accuracy"
-#   )
-
-# save_plot(p_acc_box, "per_subject_accuracy_by_model_boxplot.png", width = 10, height = 5)
-# p_acc_box
-
 p_roc_box <- ggplot(per_subject_roc, aes(x = model, y = roc_auc, fill = model)) +
   geom_boxplot(show.legend = FALSE) +
   geom_hline(yintercept = 0.5, linetype = "dashed") +
@@ -481,20 +446,6 @@ Even with a within-subject pipeline, performance varies widely across individual
 We pick the best model by median per-subject accuracy to compute per-subject accuracy and visualise the distribution.
 
 ```{r}
-# best_model <- acc_summary |>
-#   slice(1) |>
-#   pull(model)
-
-# cat("Best model (by median per-subject accuracy):", best_model, "\n")
-
-# best_per_subject <- per_subject_acc |>
-#   filter(model == best_model) |>
-#   arrange(accuracy)
-
-# cat("Mean per-subject accuracy:", round(mean(best_per_subject$accuracy), 3), "\n")
-# cat("Subjects above 70%:", sum(best_per_subject$accuracy > 0.70), "/", nrow(best_per_subject), "\n")
-# cat("Subjects at/below 50%:", sum(best_per_subject$accuracy <= 0.50), "/", nrow(best_per_subject), "\n")
-
 best_model <- roc_summary |>
   slice(1) |>
   pull(model)
@@ -511,24 +462,6 @@ cat("Subjects at/below 50%:", sum(best_per_subject$roc_auc <= 0.50), "/", nrow(b
 ```
 
 ```{r}
-# p_best_bar <- ggplot(best_per_subject, aes(x = reorder(subject_id, accuracy), y = accuracy)) +
-#   geom_col(aes(fill = accuracy), show.legend = FALSE) +
-#   geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray40") +
-#   geom_hline(
-#     yintercept = mean(best_per_subject$accuracy),
-#     linetype = "dashed", color = "red"
-#   ) +
-#   scale_y_continuous(labels = scales::percent_format()) +
-#   labs(
-#     x = NULL,
-#     y = "Accuracy",
-#     title = paste0("Per-subject accuracy (", best_model, ")")
-#   ) +
-#   theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
-
-# p_best_bar
-# save_plot(p_best_bar, "best_model_per_subject_accuracy_bar.png", width = 12, height = 5)
-
 p_best_bar <- ggplot(best_per_subject, aes(x = reorder(subject_id, roc_auc), y = roc_auc)) +
   geom_col(aes(fill = roc_auc), show.legend = FALSE) +
   geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray40") +
@@ -549,28 +482,6 @@ save_plot(p_best_bar, "best_model_per_subject_rocauc_bar.png", width = 12, heigh
 ```
 
 ```{r}
-# p_best_hist <- ggplot(best_per_subject, aes(x = accuracy)) +
-#   geom_histogram(binwidth = 0.05, fill = "lightblue", color = "white") +
-#   geom_vline(
-#     xintercept = mean(best_per_subject$accuracy),
-#     linetype = "dashed", color = "gray40", linewidth = 0.8
-#   ) +
-#   geom_vline(
-#     xintercept = 0.5,
-#     linetype = "dashed",
-#     color = "gray40",
-#     linewidth = 0.8
-#   ) +
-#   scale_x_continuous(labels = scales::percent_format()) +
-#   labs(
-#     x = "Per-subject accuracy",
-#     y = "Number of subjects",
-#     title = paste0("Distribution of per-subject accuracy (", best_model, ")")
-#   )
-
-# p_best_hist
-# save_plot(p_best_hist, "best_model_per_subject_accuracy_hist.png", width = 8, height = 5)
-
 p_best_hist <- ggplot(best_per_subject, aes(x = roc_auc)) +
   geom_histogram(binwidth = 0.05, fill = "lightblue", color = "white") +
   geom_vline(
