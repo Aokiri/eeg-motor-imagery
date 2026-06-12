@@ -330,7 +330,10 @@ extract_band_power_features(trial_1_data)
 
 So far we've only processed S001. Now we need to scale this to all 109 subjects. This will take a while since it's reading 327 EDF files (3 runs x 109 subjects) and computing features for every trial. We save the result to CSV so we only need to run this once.
 
-```{r}
+```{r eval=FALSE}
+# Set eval=TRUE to regenerate all features from the raw EDF files.
+# This reads 327 files and takes several minutes — the result is already
+# saved to data/processed/trial_features.csv.
 # Process all 109 subjects
 all_subjects_features <- tibble()
 
@@ -404,7 +407,10 @@ cat("Saved to data/processed/trial_features.csv\n")
 ```
 
 ```{r}
-dim(all_subjects_features)
+# Load pre-computed features from disk. If the chunk above was run instead,
+# this can be skipped — all_subjects_features will already be in memory.
+all_subjects_features <- read_csv("../data/processed/trial_features.csv")
+cat("Loaded", nrow(all_subjects_features), "trials from trial_features.csv\n")
 ```
 
 ## Resuming from S088
@@ -413,7 +419,10 @@ dim(all_subjects_features)
 
 S088 crashed the pipeline due to zero-variance channels (flat signal, likely a bad electrode). The updated `extract_trial_features` now handles these cases with `tryCatch` and skips them. Data from S001-S087 is still in memory, so we pick up where we left off.
 
-```{r}
+```{r eval=FALSE}
+# Crash recovery — do not run in normal conditions. The full pipeline above
+# already covers all 109 subjects. This chunk was used to resume mid-run after
+# S088 crashed the original session; set eval=TRUE only if replicating that scenario.
 # Resume from S088
 for (subj_num in 88:109) {
   subject <- sprintf("S%03d", subj_num)
@@ -522,7 +531,10 @@ stability <- subject_features |>
 subject_features <- subject_features |> left_join(stability, by = "subject_id")
 
 dim(subject_features)
+```
 
+```{r eval=FALSE}
+# Set eval=TRUE to overwrite data/processed/subject_features.csv.
 write_csv(subject_features, "../data/processed/subject_features.csv")
 cat("Saved to data/processed/subject_features.csv\n")
 ```
