@@ -2,7 +2,7 @@
 title: "EEG Motor Imagery: Left vs. Right Hand Classification"
 format: 
   html:
-    theme: flatly
+    theme: default
     toc: true
     toc-location: left
     toc-depth: 3
