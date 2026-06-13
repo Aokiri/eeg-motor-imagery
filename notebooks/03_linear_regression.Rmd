@@ -335,7 +335,7 @@ rf_fit |>
        x = "Feature", y = "Importance (Mean Decrease in Node Impurity)")
 ```
 
-## 8.1 Lasso vs. Random Forest: Feature Agreement
+## 7.1 Lasso vs. Random Forest: Feature Agreement
 
 ```{r,echo=FALSE}
 # Lasso selected features
