@@ -1,0 +1,578 @@
+---
+title: "EEG Motor Imagery: Left vs. Right Hand Classification"
+format: 
+  html:
+    theme: flatly
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    embed-resources: true
+    smooth-scroll: true
+execute:
+  warning: false
+  message: false
+---
+
+# Introduction
+
+This report outlines the binary classification of motor imagery tasks (imagining left vs. right hand movement) using per-trial EEG features. Our dataset consists of 6 core motor-cortex channels equipped with time-series, band-power, and Event-Related Desynchronization (ERD) features.
+
+EEG patterns contain extreme inter-subject variance. A significant challenge in this domain is BCI illiteracy - a physiological phenomenon where certain individuals do not produce a high enough signal-to-noise ratio during motor imagery to make the target classes separable. To account for this, our methodology avoids global modeling and relies strictly on a within-subject evaluation pipeline. To maximize predictive performance while minimizing dimensionality, we center our feature space on physiology-backed metrics: $\mu$ and $\beta$ band power, ERD features, and lateral asymmetry between the left and right hemispheres (e.g., C3 vs. C4).
+
+```{r}
+#| label: setup
+#| include: false
+
+# Imports
+library(tidyverse)
+library(tsfeatures)
+library(tidymodels)
+library(discrim)
+
+# Seed setup
+set.seed(42)
+
+# Figure setup
+project_root <- normalizePath(if (basename(getwd()) == "notebooks") ".." else ".")
+img_dir <- file.path(project_root, "assets", "images", "classification")
+dir.create(img_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Knit directory setup
+knitr::opts_knit$set(root.dir = project_root)
+
+theme_set(theme_minimal())
+
+save_plot <- function(plot, filename, width = 8, height = 5, dpi = 300) {
+  ggsave(
+    filename = file.path(img_dir, filename),
+    plot = plot,
+    width = width,
+    height = height,
+    dpi = dpi
+  )
+}
+
+```
+
+```{r}
+#| label: load-data
+#| include: false
+
+# Read the trail-level features file
+features_raw <- read_csv("data/processed/trial_features.csv", show_col_types = FALSE)
+
+```
+
+## Data Cleaning & Feature Engineering
+
+Before feeding the data into our models, we engineered a set of interaction features to capture hemispheric asymmetry. Motor imagery of the right hand typically produces desynchronization over the left hemisphere (C3), and vice versa. By calculating the difference between electrodes of the opposing sides (`C3 - C4`, `FC3 - FC4`, `CP3 - CP4`), we supply the classifiers with a direct scalar measure of this physiological response.
+
+```{r}
+#| label: cleaning
+#| echo: true
+#| results: hide
+
+features <- features_raw |>
+  mutate(
+    C_asym_mu   = C3_mu_power    - C4_mu_power,
+    C_asym_beta = C3_beta_power  - C4_beta_power,
+    FC_asym_mu  = FC3_mu_power   - FC4_mu_power,
+    FC_asym_beta = FC3_beta_power - FC4_beta_power,
+    CP_asym_mu  = CP3_mu_power   - CP4_mu_power,
+    CP_asym_beta = CP3_beta_power - CP4_beta_power
+  )
+
+mi_feature_cols <- features |>
+  select(matches("^(C3|C4|FC3|FC4|CP3|CP4)_(mu|beta)_(power|erd)$")) |>
+  colnames()
+
+predictor_cols <- c(
+  mi_feature_cols,
+  "C_asym_mu", "C_asym_beta",
+  "FC_asym_mu", "FC_asym_beta",
+  "CP_asym_mu", "CP_asym_beta"
+)
+
+model_df <- features |>
+  select(subject_id, trial_id, run, label, all_of(predictor_cols)) |>
+  mutate(label = factor(label, levels = c("left", "right")))
+
+# Drop subjects that have NaN values
+bad_subjects <- model_df |>
+  filter(if_any(all_of(predictor_cols), is.na)) |>
+  distinct(subject_id)
+
+dropped_by_subject <- model_df |>
+  semi_join(bad_subjects, by = "subject_id") |>
+  count(subject_id, name = "rows_dropped")
+
+model_df <- model_df |>
+  anti_join(bad_subjects, by = "subject_id")
+
+```
+
+Following the removal of invalid subjects, the final cleaned dataset contains `r nrow(model_df)` trials across `r n_distinct(model_df$subject_id)` subjects, utilizing `r length(predictor_cols)` engineered predictors.
+
+## Exploratory Data Analysis
+
+To understand the baseline discriminative power of our features, we visualize the density distributions for the primary motor cortex electrode (`C3`), mapped to the left and right classes.
+
+```{r}
+#| label: plot-density
+#| echo: false
+#| fig-cap: "Density distributions of individual features extracted from the C3 electrode, separated by left and right motor imagery classes. The substantial overlap indicates that individual features are not highly discriminative in isolation."
+
+p_density_c3 <- model_df |>
+  select(starts_with(c("C3_", "C4_", "C_")), label) |>
+  pivot_longer(
+    cols = -label,
+    names_to = "feature",
+    values_to = "value"
+  ) |>
+  mutate(feature = factor(feature, levels = sort(unique(feature), decreasing = TRUE))) |>
+  ggplot(aes(x = value, fill = label, color = label)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~feature, scales = "free") +
+  theme_minimal() +
+  labs(
+    x = "Feature Value",
+    y = "Density"
+  )
+
+print(p_density_c3)
+save_plot(p_density_c3, "density_distributions_c3_by_class.png", width = 12, height = 8)
+
+```
+
+Visually, the distributions for the 'left' and 'right' classes show almost perfect overlap. This highlights the low signal-to-noise ratio of EEG data: no single univariate feature is sufficient for classification. To quantify this mathematically, we apply a Kolmogorov-Smirnov (KS) test to these distributions.
+
+```{r}
+#| label: ks-test
+#| echo: true
+#| results: hide
+
+model_df |>
+  select(starts_with(c("C3_", "C4_", "C_")), label) |>
+  pivot_longer(
+    cols = -label,
+    names_to = "feature",
+    values_to = "value"
+  ) |>
+  group_by(feature) |>
+  summarise(
+    ks_stat = ks.test(
+      value[label == "left"], value[label == "right"]
+    )$statistic,
+    p_value = ks.test(
+      value[label == "left"], value[label == "right"]
+    )$p.value,
+    .groups = "drop"
+  ) |>
+  arrange(p_value)
+
+```
+
+The KS test statistics confirm small differences between the classes. This low univariate separability mandates the use of multivariate classifiers capable of defining complex decision boundaries.
+
+## Preprocessing & Dimensionality Reduction
+
+We perform a stratified 20% test-train split per subject to guarantee balanced classes in our test sets while maintaining strict subject isolation. We then apply subject-level standardization using scaling statistics derived only from the training subset to prevent data leakage.
+
+```{r}
+#| label: cv-split
+#| echo: true
+#| results: hide
+
+test_keys <- model_df |>
+  group_by(subject_id, label) |>
+  slice_sample(prop = 0.2) |>
+  ungroup() |>
+  select(subject_id, trial_id)
+
+train_data <- model_df |>
+  anti_join(test_keys, by = c("subject_id", "trial_id"))
+
+test_data <- model_df |>
+  semi_join(test_keys, by = c("subject_id", "trial_id"))
+
+```
+
+```{r}
+#| label: scaler
+#| echo: true
+#| results: hide
+
+fit_subject_scaler <- function(train_df, feature_cols) {
+  train_df |>
+    group_by(subject_id) |>
+    summarise(
+      across(
+        all_of(feature_cols),
+        list(
+          mean = ~ mean(.x, na.rm = TRUE),
+          sd = ~ sd(.x, na.rm = TRUE)
+        ),
+        .names = "{.col}__{.fn}"
+      ),
+      .groups = "drop"
+    )
+}
+
+transform_subject_scaler <- function(df, scaler, feature_cols, eps = 1e-8) {
+  out <- df |>
+    left_join(scaler, by = "subject_id")
+
+  for (feature in feature_cols) {
+    m <- out[[paste0(feature, "__mean")]]
+    s <- out[[paste0(feature, "__sd")]]
+    s[is.na(s) | s < eps] <- 1
+    out[[feature]] <- (out[[feature]] - m) / (s + eps)
+  }
+
+  out |>
+    select(-ends_with("__mean"), -ends_with("__sd"))
+}
+
+scaler <- fit_subject_scaler(train_data, predictor_cols)
+train_scaled <- transform_subject_scaler(train_data, scaler, predictor_cols)
+test_scaled <- transform_subject_scaler(test_data, scaler, predictor_cols)
+
+```
+
+Because our features demonstrate high multicollinearity (spacially close electrodes capture overlapping regional signals), we apply Principal Component Analysis (PCA). To determine the optimal number of components without arbitrary selection, we evaluate the cumulative explained variance.
+
+```{r}
+#| label: pca-logic
+#| echo: true
+#| results: hide
+
+pca_prep <- recipe(label ~ ., data = train_scaled) |>
+  update_role(subject_id, trial_id, run, new_role = "ID") |>
+  step_impute_mean(all_numeric_predictors()) |>
+  step_zv(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_pca(all_numeric_predictors(), num_comp = length(predictor_cols)) |>
+  prep()
+
+pca_variance <- tidy(pca_prep, number = 4, type = "variance") |> 
+  filter(terms == "cumulative percent variance") |> 
+  mutate(cumulative_variance = value / 100)
+
+```
+
+Based on the PCA analysis, the number of principal components required to reach common variance thresholds are:
+
+* 80% threshold: `r min(pca_variance$component[pca_variance$cumulative_variance >= 0.80])` components.
+* 90% threshold: `r min(pca_variance$component[pca_variance$cumulative_variance >= 0.90])` components.
+
+```{r}
+#| label: pca-plot
+#| echo: false
+#| fig-cap: "PCA cumulative explained variance curve mapping the proportion of dataset variance retained as principal components are added. The dashed lines indicate the 80% and 90% variance thresholds."
+
+p_pca_variance <- ggplot(pca_variance, aes(x = component, y = cumulative_variance)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  geom_hline(yintercept = c(0.80, 0.90), linetype = "dashed", color = "gray50") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(
+    x = "Number of Principal Components", 
+    y = "Cumulative Variance"
+  )
+
+print(p_pca_variance)
+save_plot(p_pca_variance, "pca_explained_variance.png", width = 7, height = 4)
+
+```
+
+The PCA curve shows that 80% of the variance across our feature space is captured within the first 5 principal components. We use an 80% variance threshold in our preprocessing pipeline to avoid overfitting to sensory noise.
+
+## Model Setup & Training
+
+We benchmark four algorithms against one another to identify the most robust architecture for this data:
+
+1. Logistic Regression (Elastic Net Regularization)
+2. Naive Bayes
+3. K-Nearest Neighbors (KNN)
+4. Random Forest
+
+A v-fold cross-validation is performed at the session-run level rather than the trial level to prevent temporal data leakage.
+
+```{r}
+#| label: model-specs
+#| echo: true
+#| results: hide
+
+base_recipe <- recipe(label ~ ., data = train_scaled) |>
+  update_role(subject_id, trial_id, run, new_role = "ID") |>
+  step_impute_mean(all_numeric_predictors()) |>
+  step_zv(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_pca(all_numeric_predictors(), threshold = .8)
+
+eval_metrics <- metric_set(accuracy, sensitivity, specificity, roc_auc)
+
+fit_and_predict <- function(
+  model_spec, 
+  recipe, 
+  train_df, 
+  test_df, 
+  resamples = NULL, 
+  grid = NULL, 
+  metrics = eval_metrics, 
+  select_metric = "roc_auc") {
+  
+  wf <- workflow() |>
+    add_recipe(recipe) |>
+    add_model(model_spec)
+
+  params <- workflows::extract_parameter_set_dials(wf)
+
+  # No tune() params -> just fit once
+  if (nrow(params) == 0) {
+    fit <- fit(wf, data = train_df)
+    return(bind_rows(
+      augment(fit, new_data = train_df) |> mutate(split = "train"),
+      augment(fit, new_data = test_df) |> mutate(split = "test")
+    ))
+  }
+
+  # Has tune() params -> must tune first
+  if (is.null(resamples) || is.null(grid)) {
+    stop("This model has tune() parameters; pass `resamples` and `grid`.")
+  }
+
+  tuned <- tune::tune_grid(
+    wf,
+    resamples = resamples,
+    grid = grid,
+    metrics = metrics
+  )
+
+  best <- tune::select_best(tuned, metric = select_metric)
+
+  fit <- tune::finalize_workflow(wf, best) |>
+    fit(data = train_df)
+  bind_rows(
+    augment(fit, new_data = train_df) |> mutate(split = "train"),
+    augment(fit, new_data = test_df) |> mutate(split = "test")
+  )
+}
+
+```
+
+```{r}
+#| label: model-training
+#| echo: true
+#| results: hide
+
+## Model specs (kept constant across subjects)
+logreg_spec <- logistic_reg(penalty = tune(), mixture = tune()) |> set_engine("glmnet") |> set_mode("classification")
+logreg_grid <- dials::grid_space_filling(dials::penalty(range = c(-1, 2)), dials::mixture(range = c(0, 1)), size = 10)
+
+nb_spec <- naive_Bayes(Laplace = tune()) |> set_engine("naivebayes") |> set_mode("classification")
+nb_grid <- dials::grid_space_filling(dials::Laplace(range = c(0.1, 5)), size = 10)
+
+knn_spec <- nearest_neighbor(neighbors = tune()) |> set_engine("kknn") |> set_mode("classification")
+knn_grid <- dials::grid_space_filling(dials::neighbors(range = c(5, 15)), size = 10)
+
+rf_spec <- rand_forest(trees = 500, mtry = tune(), min_n = tune()) |> set_engine("ranger", max.depth = 3) |> set_mode("classification")
+rf_grid <- dials::grid_space_filling(dials::mtry(range = c(1, 3)), dials::min_n(range = c(10, 20)), size = 10)
+
+make_subject_folds <- function(train_df) {
+  n_runs <- n_distinct(train_df$run)
+  rsample::group_vfold_cv(train_df, v = n_runs, group = run)
+}
+
+fit_subject_models <- function(subject_train, subject_test) {
+  folds <- make_subject_folds(subject_train)
+
+  preds_logreg <- fit_and_predict(logreg_spec, base_recipe, subject_train, subject_test, resamples = folds, grid = logreg_grid) |> mutate(model = "Logistic Regression")
+  preds_nb <- fit_and_predict(nb_spec, base_recipe, subject_train, subject_test, resamples = folds, grid = nb_grid) |> mutate(model = "Naive Bayes")
+  preds_knn <- fit_and_predict(knn_spec, base_recipe, subject_train, subject_test, resamples = folds, grid = knn_grid) |> mutate(model = "KNN")
+  preds_rf <- fit_and_predict(rf_spec, base_recipe, subject_train, subject_test, resamples = folds, grid = rf_grid) |> mutate(model = "Random Forest")
+
+  bind_rows(preds_logreg, preds_nb, preds_knn, preds_rf)
+}
+
+subjects <- sort(unique(train_scaled$subject_id))
+
+all_preds <- purrr::map_dfr(subjects, function(sid) {
+  subject_train <- train_scaled |> filter(subject_id == sid)
+  subject_test <- test_scaled |> filter(subject_id == sid)
+  fit_subject_models(subject_train, subject_test)
+}, .progress = "Fitting subjects")
+
+pooled_metrics <- all_preds |>
+  group_by(split, model) |>
+  group_modify(~ eval_metrics(.x, truth = label, estimate = .pred_class, .pred_left)) |>
+  ungroup() |>
+  select(split, model, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  arrange(split, model)
+
+```
+
+## Aggregate Performance
+
+If we ignore for a moment subject isolation and evaluate the pooled test predictions globally, we can observe the aggregate efficiency of the models.
+
+```{r}
+#| label: roc-curves-plot
+#| echo: false
+#| fig-cap: "Aggregate ROC curves evaluated across the entire testing dataset. The proximity to the diagonal baseline underscores the poor performance of global evaluation when severe inter-subject physiological differences are ignored."
+
+p_test_preds <- all_preds |>
+  filter(split == "test")
+
+p_roc_all_models <- p_test_preds |>
+  group_by(model) |>
+  roc_curve(truth = label, .pred_left) |>
+  autoplot()
+
+print(p_roc_all_models)
+save_plot(p_roc_all_models, "roc_curves_all_models.png", width = 8, height = 6)
+
+```
+
+The aggregate ROC curves trace a path very close to the diagonal (AUC roughly 0.55-0.60). While Logistic Regression and Random Forest show a slight statistical edge globally, the overall performance appears exceptionally weak. However, in BCI literature, reporting pooled metrics is widely considered an bad practice. Because cortical anatomy and cognitive strategy vary radically from person to person, pooling predictions worsens the performance of highly successful, subject-specific models with the output of subjects whose models failed to converge.
+
+## Subject-Level Evaluation
+
+To evaluate the true capabilities of our pipeline, we must disaggregate the performance metrics per subject to measure how reliably the models fit individual baseline distributions.
+
+```{r}
+#| label: per-subject-summary
+#| echo: false
+#| results: markup
+
+per_subject_roc <- p_test_preds |>
+  group_by(model, subject_id) |>
+  summarise(
+    roc_auc = yardstick::roc_auc_vec(
+      truth = label,
+      estimate = .pred_left
+    ),
+    n_trials = n(),
+    .groups = "drop"
+  )
+
+roc_summary <- per_subject_roc |>
+  group_by(model) |>
+  summarise(
+    mean_auc = mean(roc_auc),
+    median_auc = median(roc_auc),
+    above_70 = sum(roc_auc > 0.70),
+    at_or_below_50 = sum(roc_auc <= 0.50),
+    n_subjects = n(),
+    .groups = "drop"
+  ) |>
+  arrange(desc(median_auc), desc(mean_auc))
+
+roc_summary
+
+```
+
+```{r}
+#| label: boxplots
+#| echo: false
+#| fig-cap: "Boxplot distributions of per-subject ROC AUC scores across the four tested models. The large inter-quartile ranges highlight the extreme variance in prediction accuracy across the participant pool."
+
+p_roc_box <- ggplot(per_subject_roc, aes(x = model, y = roc_auc, fill = model)) +
+  geom_boxplot(show.legend = FALSE) +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = NULL,
+    y = "ROC AUC"
+  )
+
+save_plot(p_roc_box, "per_subject_rocauc_by_model_boxplot.png", width = 10, height = 5)
+print(p_roc_box)
+
+```
+
+Disaggregating the data changes the results. Rather than universally poor performance, we observe inter-subject variance. Test set scores span the entire probability space, ranging from worse-than-chance generalization to perfect (100%) separability.
+
+Notably, Logistic Regression fails to generalize for a large segment of the participant pool. Its median and 25th percentile are clamped exactly at 50%, a clear indicator that the elastic net penalty overpowered the loss function on noisy subjects, forcing the model to predict a single majority class. On the other hand, Naive Bayes, Random Forest, and KNN establish more robust medians (roughly 55–57%). Naive Bayes and Random Forest demonstrate the widest spread, successfully mapping the decision boundaries for the high-performing subjects.
+
+## Best Model Analysis: Naive Bayes
+
+Let's isolate our top-performing architecture to visualize the distribution of BCI illiteracy across the subject population.
+
+```{r}
+#| label: best-model-calc
+#| include: false
+
+best_model <- roc_summary |>
+  slice(1) |>
+  pull(model)
+
+best_per_subject <- per_subject_roc |>
+  filter(model == best_model) |>
+  arrange(roc_auc)
+
+```
+
+The best model by median per-subject ROC AUC is `r best_model`. Its characteristics across the population are as follows:
+
+* Mean per-subject ROC AUC: `r round(mean(best_per_subject$roc_auc), 3)`
+* Subjects achieving above 70% accuracy: `r sum(best_per_subject$roc_auc > 0.70)` out of `r nrow(best_per_subject)`
+* Subjects at or below chance level (≤50%): `r sum(best_per_subject$roc_auc <= 0.50)` out of `r nrow(best_per_subject)`
+
+```{r}
+#| label: best-model-bar
+#| echo: false
+#| fig-cap: "Individual subject ROC AUC scores plotted in ascending order using the Naive Bayes estimator. The red dashed line denotes the population mean, while the grey dashed line represents chance accuracy (50%)."
+
+p_best_bar <- ggplot(best_per_subject, aes(x = reorder(subject_id, roc_auc), y = roc_auc)) +
+  geom_col(aes(fill = roc_auc), show.legend = FALSE) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray40") +
+  geom_hline(
+    yintercept = mean(best_per_subject$roc_auc),
+    linetype = "dashed", color = "red"
+  ) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = NULL,
+    y = "ROC AUC"
+  ) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+print(p_best_bar)
+save_plot(p_best_bar, "best_model_per_subject_rocauc_bar.png", width = 12, height = 5)
+
+```
+
+```{r}
+#| label: best-model-hist
+#| echo: false
+#| fig-cap: "Histogram demonstrating the highly spread, bimodal distribution of per-subject ROC AUC scores using the Naive Bayes model. Note the stark split between low-performing subjects and those with highly separable signal patterns."
+
+p_best_hist <- ggplot(best_per_subject, aes(x = roc_auc)) +
+  geom_histogram(binwidth = 0.05, fill = "lightblue", color = "white") +
+  geom_vline(
+    xintercept = mean(best_per_subject$roc_auc),
+    linetype = "dashed", color = "gray40", linewidth = 0.8
+  ) +
+  geom_vline(
+    xintercept = 0.5,
+    linetype = "dashed",
+    color = "gray40",
+    linewidth = 0.8
+  ) +
+  scale_x_continuous(labels = scales::percent_format()) +
+  labs(
+    x = "Per-subject ROC AUC",
+    y = "Number of subjects"
+  )
+
+print(p_best_hist)
+save_plot(p_best_hist, "best_model_per_subject_rocauc_hist.png", width = 8, height = 5)
+
+```
+
+The bar and histogram visualizations show a highly spread, broadly bimodal distribution across the subject pool, confirming the phenomenon of BCI illiteracy:
+
+* A distinct part of high-performers forms a distribution mode on the right, successfully exceeding 75% AUC and reaching up to 100%. For these individuals, the Naive Bayes algorithm captures highly separable, robust physiological responses in the feature space.
+* A large segment of low-performers forms a separate mode centered around and well below the 50% chance mark. A substantial portion of the population scores in the 25%–50% test range. This indicates that these subjects lack separable features. As a consequence, models trained on their data either guess randomly or overfit heavily to training noise, leading to worse-than-chance generalization on unseen data.
