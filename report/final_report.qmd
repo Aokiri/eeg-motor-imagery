@@ -369,17 +369,16 @@ compute_band_power <- function(x, low, high, sr = 160) {
 ```{r}
 #| label: test-band-power
 #| echo: true
-#| results: markup
+#| results: hide
 
 # Verify on trial 1, C3 channel
 c3_signal <- all_trials |> filter(trial_id == 1, channel == "C3") |> pull(value)
 
 mu_power   <- compute_band_power(c3_signal, 8, 13)
 beta_power <- compute_band_power(c3_signal, 13, 30)
-
-cat("C3 mu power (log-var):  ", round(mu_power, 4), "\n")
-cat("C3 beta power (log-var):", round(beta_power, 4), "\n")
 ```
+
+For the first trial on C3: mu band power is `r round(mu_power, 4)` and beta band power is `r round(beta_power, 4)` (log-variance units).
 
 ```{r}
 #| label: plot-band-power-prep
@@ -526,7 +525,36 @@ cat("Saved to data/processed/trial_features.csv\n")
 # Load pre-computed features from disk. If the chunk above was run instead,
 # this can be skipped — all_subjects_features will already be in memory.
 all_subjects_features <- read_csv("data/processed/trial_features.csv")
-cat("Loaded", nrow(all_subjects_features), "trials from trial_features.csv\n")
+```
+
+## Lateral asymmetry features
+
+Motor imagery of the right hand produces desynchronization over the left hemisphere (C3), and vice versa. To give the classifiers a direct scalar measure of this response, we compute the difference in band power between contralateral and ipsilateral electrode pairs for both the mu and beta bands across the three electrode pairs (C3/C4, FC3/FC4, CP3/CP4).
+
+```{r}
+#| label: asymmetry-features
+#| echo: true
+#| results: hide
+
+all_subjects_features <- all_subjects_features |>
+  mutate(
+    C_asym_mu    = C3_mu_power    - C4_mu_power,
+    C_asym_beta  = C3_beta_power  - C4_beta_power,
+    FC_asym_mu   = FC3_mu_power   - FC4_mu_power,
+    FC_asym_beta = FC3_beta_power - FC4_beta_power,
+    CP_asym_mu   = CP3_mu_power   - CP4_mu_power,
+    CP_asym_beta = CP3_beta_power - CP4_beta_power
+  )
+```
+
+```{r}
+#| label: save-enriched-trial-features
+#| eval: true
+#| echo: true
+
+# Overwrites trial_features.csv with the six asymmetry columns added.
+# The classification section loads from this file and depends on those columns.
+write_csv(all_subjects_features, "data/processed/trial_features.csv")
 ```
 
 ## Resuming from S088
@@ -694,11 +722,6 @@ Quick sanity check on the final outputs before wrapping up.
 # Verify label balance in trial features
 all_subjects_features |> count(label)
 
-# Verify subject count and feature dimensions
-cat("Subjects:", n_distinct(subject_features$subject_id), "\n")
-# Minus subject_id and n_trials
-cat("Feature columns:", ncol(subject_features) - 2, "\n")
-
 # Preview the trial features
 all_subjects_features |>
   select(subject_id, trial_id, label, C3_entropy,
@@ -708,7 +731,7 @@ all_subjects_features |>
 
 ## Summary
 
-Labels are well balanced (2469 left vs 2425 right). 109 subjects, 168 aggregated features per subject. Both output CSVs are ready for the classification and regression tasks respectively.
+Labels are well balanced (see count table above). `r n_distinct(subject_features$subject_id)` subjects, `r ncol(subject_features) - 2` aggregated features per subject. Both output CSVs are ready for the classification and regression tasks respectively.
 
 This notebook covered the full exploration: reading EDF files, understanding the event structure, segmenting trials, extracting features with `tsfeatures`, and aggregating per subject. The clean, reproducible version of this pipeline goes in `src/preprocess.R`.
 
@@ -721,7 +744,7 @@ This report outlines the binary classification of motor imagery tasks (imagining
 EEG patterns contain extreme inter-subject variance. A significant challenge in this domain is BCI illiteracy - a physiological phenomenon where certain individuals do not produce a high enough signal-to-noise ratio during motor imagery to make the target classes separable. To account for this, our methodology avoids global modeling and relies strictly on a within-subject evaluation pipeline. To maximize predictive performance while minimizing dimensionality, we center our feature space on physiology-backed metrics: $\mu$ and $\beta$ band power, ERD features, and lateral asymmetry between the left and right hemispheres (e.g., C3 vs. C4).
 
 ```{r}
-#| label: setup
+#| label: setup-classification
 #| include: false
 
 # Imports
@@ -762,24 +785,16 @@ save_plot <- function(plot, filename, width = 8, height = 5, dpi = 300) {
 features_raw <- read_csv("data/processed/trial_features.csv", show_col_types = FALSE)
 ```
 
-## Data Cleaning & Feature Engineering
+## Data Preparation
 
-Before feeding the data into our models, we engineered a set of interaction features to capture hemispheric asymmetry. Motor imagery of the right hand typically produces desynchronization over the left hemisphere (C3), and vice versa. By calculating the difference between electrodes of the opposing sides (`C3 - C4`, `FC3 - FC4`, `CP3 - CP4`), we supply the classifiers with a direct scalar measure of this physiological response.
+The trial features file already includes the six lateral asymmetry columns computed during preprocessing. Here we select the relevant predictors and remove subjects with missing values.
 
 ```{r}
 #| label: cleaning
 #| echo: true
 #| results: hide
 
-features <- features_raw |>
-  mutate(
-    C_asym_mu   = C3_mu_power    - C4_mu_power,
-    C_asym_beta = C3_beta_power  - C4_beta_power,
-    FC_asym_mu  = FC3_mu_power   - FC4_mu_power,
-    FC_asym_beta = FC3_beta_power - FC4_beta_power,
-    CP_asym_mu  = CP3_mu_power   - CP4_mu_power,
-    CP_asym_beta = CP3_beta_power - CP4_beta_power
-  )
+features <- features_raw
 
 mi_feature_cols <- features |>
   select(matches("^(C3|C4|FC3|FC4|CP3|CP4)_(mu|beta)_(power|erd)$")) |>
@@ -837,7 +852,7 @@ p_density_c3 <- model_df |>
     y = "Density"
   )
 
-print(p_density_c3)
+p_density_c3
 save_plot(p_density_c3, "density_distributions_c3_by_class.png", width = 12, height = 8)
 ```
 
@@ -973,7 +988,7 @@ p_pca_variance <- ggplot(pca_variance, aes(x = component, y = cumulative_varianc
     y = "Cumulative Variance"
   )
 
-print(p_pca_variance)
+p_pca_variance
 save_plot(p_pca_variance, "pca_explained_variance.png", width = 7, height = 4)
 ```
 
@@ -1120,7 +1135,7 @@ p_roc_all_models <- p_test_preds |>
   roc_curve(truth = label, .pred_left) |>
   autoplot()
 
-print(p_roc_all_models)
+p_roc_all_models
 save_plot(p_roc_all_models, "roc_curves_all_models.png", width = 8, height = 6)
 ```
 
@@ -1176,7 +1191,7 @@ p_roc_box <- ggplot(per_subject_roc, aes(x = model, y = roc_auc, fill = model)) 
   )
 
 save_plot(p_roc_box, "per_subject_rocauc_by_model_boxplot.png", width = 10, height = 5)
-print(p_roc_box)
+p_roc_box
 ```
 
 Disaggregating the data changes the results. Rather than universally poor performance, we observe inter-subject variance. Test set scores span the entire probability space, ranging from worse-than-chance generalization to perfect (100%) separability.
@@ -1225,7 +1240,7 @@ p_best_bar <- ggplot(best_per_subject, aes(x = reorder(subject_id, roc_auc), y =
   ) +
   theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
 
-print(p_best_bar)
+p_best_bar
 save_plot(p_best_bar, "best_model_per_subject_rocauc_bar.png", width = 12, height = 5)
 ```
 
@@ -1252,7 +1267,7 @@ p_best_hist <- ggplot(best_per_subject, aes(x = roc_auc)) +
     y = "Number of subjects"
   )
 
-print(p_best_hist)
+p_best_hist
 save_plot(p_best_hist, "best_model_per_subject_rocauc_hist.png", width = 8, height = 5)
 ```
 
@@ -1266,7 +1281,7 @@ The bar and histogram visualizations show a highly spread, broadly bimodal distr
 ## 1. Setup & Data Loading
 
 ```{r}
-#| label: setup
+#| label: setup-regression
 #| include: false
 
 library(dplyr)
@@ -1282,17 +1297,16 @@ We load the processed subject features and keep only the mean EEG features along
 ```{r}
 #| label: data-loading
 #| echo: true
-#| results: markup
+#| results: hide
 
 subject_features <- read.csv("data/processed/subject_features.csv")
 
 reg_data <- subject_features |>
   select(subject_id, ends_with("_mean"), stability_score) |>
   drop_na()
-
-cat("Subjects after cleaning:", nrow(reg_data), "\n")
-cat("Number of predictors:", ncol(reg_data) - 2, "\n")
 ```
+
+After removing subjects with missing values, the dataset contains `r nrow(reg_data)` subjects and `r ncol(reg_data) - 2` predictors.
 
 ---
 
@@ -1303,7 +1317,7 @@ We split the data 70/30 into training and test sets. All preprocessing parameter
 ```{r}
 #| label: train-test-split
 #| echo: true
-#| results: markup
+#| results: hide
 
 set.seed(42)
 reg_data_split <- reg_data %>% initial_split(prop = 0.7)
@@ -1314,10 +1328,9 @@ x_train_raw <- train_data %>% select(-stability_score, -subject_id)
 y_train_raw <- train_data %>% pull(stability_score)
 x_test_raw  <- test_data  %>% select(-stability_score, -subject_id)
 y_test_raw  <- test_data  %>% pull(stability_score)
-
-cat("Training set:", nrow(train_data), "subjects\n")
-cat("Test set:    ", nrow(test_data),  "subjects\n")
 ```
+
+The split yields `r nrow(train_data)` training subjects and `r nrow(test_data)` test subjects.
 
 ---
 
@@ -1368,7 +1381,7 @@ metrics_raw <- data.frame(
   R2      = c(r2_fn(y_train_raw,   pred_raw_train), r2_fn(y_test_raw,   pred_raw_test))
 )
 
-print(metrics_raw)
+metrics_raw
 ```
 
 ### 3.2 Model 2: OLS on Normalized Data
@@ -1412,7 +1425,7 @@ metrics_norm <- data.frame(
   R2      = c(r2_fn(y_train_raw,   pred_norm_train), r2_fn(y_test_raw,   pred_norm_test))
 )
 
-print(metrics_norm)
+metrics_norm
 ```
 
 ### 3.3 Model 3: Lasso Regression
@@ -1450,7 +1463,6 @@ lasso_tune <- tune_grid(
 
 # --- Select best lambda by CV RMSE ---
 best_lambda <- select_best(lasso_tune, metric = "rmse")
-cat("Best lambda:", round(best_lambda$penalty, 6), "\n")
 
 # --- Finalize workflow and fit on full training set ---
 lasso_final <- finalize_workflow(lasso_wf, best_lambda)
@@ -1468,7 +1480,7 @@ metrics_lasso <- data.frame(
   R2      = c(r2_fn(y_train_raw,   pred_lasso_train), r2_fn(y_test_raw,   pred_lasso_test))
 )
 
-print(metrics_lasso)
+metrics_lasso
 
 # --- Features selected ---
 lasso_coef_tidy <- lasso_fit %>%
@@ -1477,8 +1489,9 @@ lasso_coef_tidy <- lasso_fit %>%
   filter(term != "(Intercept)")
 
 n_selected <- sum(lasso_coef_tidy$estimate != 0)
-cat("\nLasso selected", n_selected, "features out of", ncol(x_train_raw), "\n")
 ```
+
+Cross-validation selected a penalty of `r round(best_lambda$penalty, 6)`. Lasso retained `r n_selected` features out of `r ncol(x_train_raw)`.
 
 ### 3.4 Model 4: Random Forest
 
@@ -1509,7 +1522,7 @@ metrics_rf <- data.frame(
   R2      = c(r2_fn(y_train_raw,   pred_rf_train), r2_fn(y_test_raw,   pred_rf_test))
 )
 
-print(metrics_rf)
+metrics_rf
 ```
 
 ---
@@ -1527,7 +1540,7 @@ The OLS models are included for reference only. The meaningful comparison is Las
 
 all_metrics <- rbind(metrics_raw, metrics_norm, metrics_lasso, metrics_rf)
 all_metrics <- all_metrics %>% mutate(across(where(is.numeric), ~round(., 4)))
-print(all_metrics)
+all_metrics
 ```
 
 ### 4.2 Predicted vs. Actual (Lasso & Random Forest - Test Set)
@@ -1700,15 +1713,10 @@ comparison_df <- lasso_selected %>%
   ) %>%
   arrange(desc(abs(Lasso_Coef)))
 
-cat(sprintf(
-  "Lasso kept %d features | RF agrees on %d (top-%d overlap)\n\n",
-  n_lasso,
-  sum(comparison_df$RF_Agrees == "YES"),
-  n_lasso
-))
-
-print(comparison_df)
+comparison_df
 ```
+
+Lasso retained `r nrow(lasso_coef_df)` features; of those, `r sum(comparison_df$RF_Agrees == "YES")` appear in Random Forest's top-`r nrow(lasso_coef_df)` by importance.
 
 ---
 
@@ -1725,7 +1733,7 @@ test_metrics <- all_metrics %>%
   arrange(RMSE) %>%
   mutate(across(where(is.numeric), ~round(., 4)))
 
-print(test_metrics)
+test_metrics
 ```
 
 The two OLS models are not meaningful competitors - with p > n they memorize the training set perfectly and fail on unseen data. The real comparison is Lasso vs. Random Forest. Lasso provides a sparse linear model with automatic feature selection; Random Forest captures non-linear structure and interactions without any explicit selection step.
