@@ -16,7 +16,7 @@ Not all subjects produce separable EEG patterns during motor imagery: a phenomen
 
 [EEG Motor Movement/Imagery Dataset](https://physionet.org/content/eegmmidb/1.0.0/) from PhysioNet. 109 subjects, 64 EEG channels, motor execution and imagery tasks.
 
-Raw data is not included in the repo due to size (~several GB). To download:
+Raw data is not included in the repo due to size (~3.3 GB). To download:
 
 ### Linux / macOS (recommended)
 
@@ -36,6 +36,25 @@ aws s3 sync --no-sign-request s3://physionet-open/eegmmidb/1.0.0/ data/raw/
 
 Place the downloaded files in `data/raw/`.
 
+## Setup
+
+> [!NOTE]
+> You must have [Git](https://git-scm.com/downloads), [VSCode](https://code.visualstudio.com/), [Podman](https://podman.io/)/[Docker](https://docs.docker.com/get-docker/) and [Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) for VSCode installed on your system.
+
+1. Clone the repository:
+
+    `git clone https://github.com/Aokiri/eeg-motor-imagery.git`
+
+2. Navigate to the project directory.
+3. Move input data to `data/raw/` directory
+4. Open project root directory in Devcontainer:
+    * Open the project directory in VS Code.
+    * Press `Ctrl+Shift+P` (or `Cmd+Shift+P` on Mac) to open the Command Palette.
+    * Type and select **"Dev Containers: Reopen in Container"**.
+    * VS Code will build the Docker image, install the required R packages, and set up the headless display automatically.
+3. Run the Notebook:
+    * Once the container is running, open `report/final_report.qmd`.
+
 ## Project structure
 
 ```
@@ -43,17 +62,22 @@ eeg-motor-imagery/
 ├── data/
 │   ├── raw/                     # EDF files from PhysioNet (not tracked)
 │   └── processed/
-│       ├── trial_features.csv   # per-trial features (4,894 trials × 108 features)
+│       ├── all_preds.rds        # all predictions of classifiers
+│       ├── trial_features.csv   # per-trial features (4,894 trials x 108 features)
 │       └── subject_features.csv # per-subject aggregated features + stability_score
 ├── notebooks/
-│   ├── 01_exploration.Rmd       # data exploration and pipeline walkthrough
-│   ├── 02_classification.Rmd   # binary classification (left vs right)
+│   ├── 01_exploration.Rmd       # data exploration
+│   ├── 02_classification.Rmd    # binary classification (left vs right)
 │   └── 03_linear_regression.Rmd # regression on stability_score
 ├── src/
 │   ├── preprocess_trials.R      # EDF → trial_features.csv
 │   └── preprocess_subjects.R    # trial_features.csv → subject_features.csv
 ├── presentation/
 │   └── r-presentation-dist.html
+├── report/
+│   ├── final_report.html        # Rendered Final report
+│   ├── final_report.qmd         # Final report Quarto file
+│   └── references.bib           # References used in the report
 ├── .gitignore
 └── README.md
 ```
