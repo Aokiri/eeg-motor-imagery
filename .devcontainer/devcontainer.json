@@ -16,5 +16,5 @@
     // "postCreateCommand": "Rscript -e 'if (file.exists(\"renv.lock\")) renv::restore(prompt = FALSE)'"
     // 1. Installs the missing Linux layout package (libglpk-dev) at the OS level
     // 2. Automatically triggers renv::restore()
-    "postCreateCommand": "sudo apt-get update && sudo apt-get install -y libglpk-dev && Rscript -e 'if (file.exists(\"renv.lock\")) renv::restore(prompt = FALSE)'"
+    "postCreateCommand": "sudo apt-get update && sudo apt-get install -y cmake libglpk-dev xvfb && Rscript -e \"if (file.exists('renv.lock')) renv::restore(prompt = FALSE)\""
 }

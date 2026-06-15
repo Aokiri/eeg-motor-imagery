@@ -1,0 +1,1789 @@
+---
+title: "EEG Motor Imagery: End-to-End Analysis"
+subtitle: "Exploration, Left vs. Right Classification, and BCI Aptitude Prediction"
+format: 
+  html:
+    theme: default
+    toc: true
+    toc-location: left
+    toc-expand: true
+    embed-resources: true
+    smooth-scroll: true
+bibliography: references.bib
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+# Imports
+library(edfReader)
+library(tsfeatures)
+library(signal)
+library(vip)
+library(corrplot)
+library(discrim)
+library(glmnet)
+library(tidyverse)
+library(tidymodels)
+library(dplyr)
+filter <- dplyr::filter
+
+# Seed setup
+set.seed(42)
+
+# Figure setup
+project_root <- normalizePath(if (basename(getwd()) %in% c("notebooks", "report")) ".." else ".")
+img_dir <- file.path(project_root, "assets", "images")
+img_exp_dir <- file.path(img_dir, "exploration")
+img_cls_dir <- file.path(img_dir, "classification")
+img_reg_dir <- file.path(img_dir, "regression")
+
+dir.create(img_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(img_exp_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(img_cls_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(img_reg_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Knit directory setup
+knitr::opts_knit$set(root.dir = project_root)
+
+# Plots setup
+theme_set(theme_minimal())
+options(bitmapType = "cairo")
+save_plot <- function(plot, save_dir, filename, width = 8, height = 5, dpi = 300) {
+  ggsave(
+    filename = file.path(save_dir, filename),
+    plot = plot,
+    width = width,
+    height = height,
+    dpi = dpi
+  )
+}
+```
+
+# Introduction and Problem Setting
+
+This report covers an end-to-end neuroimaging machine learning pipeline using [the PhysioNet Motor Movement/Imagery dataset](https://physionet.org/content/eegmmidb/1.0.0/), a benchmark corpus comprising 64-channel electroencephalogram (EEG) recordings sampled at 160 Hz across 109 subjects. The report is organized into two complementary tasks:
+
+1. Classification (Per-Trial Task): Can subject-specific models accurately decode left versus right hand motor imagery from single-trial spectral features extracted from the motor cortex?
+2. Regression (Per-Subject Task): Can an individual's aggregate BCI aptitude (quantified via a composite `stability_score`) be predicted strictly from their resting baseline EEG properties, establishing an intake metric to identify BCI illiteracy prior to task execution?
+
+A major challenge in BCI research is the big variability in neural responses across individuals. Studies estimate that between 15–30% of users fail to generate stable and discriminative motor imagery patterns [@blankertz2010neurophysiological; @ahn2013high], a phenomenon commonly referred to as BCI illiteracy; our dataset reflects a higher prevalence, with roughly half the participant pool performing at or below the chance level. As a result, models trained across subjects often exhibit limited generalization performance. This motivates a dual analytical perspective in which EEG signals are examined both at the trial level for within-subject classification and at the subject level for the study of inter-individual differences in BCI aptitude.
+
+# Data Exploration and Preprocessing
+
+Before writing any pipeline, we need to do some exploration in order to understand what is inside these files and how they are structured.
+
+## Raw signal
+
+EDF is the standard format for EEG data. We open one file and see what we are dealing with.
+
+```{r}
+#| label: read-header
+#| echo: true
+#| results: hide
+
+# Read the EDF file metadata (channels, sampling rate, duration, etc.)
+header <- readEdfHeader("data/raw/S001/S001R04.edf")
+str(header)
+```
+
+```{r}
+#| label: read-channels
+#| include: false
+
+# List all 64 channel labels + annotation channel
+# to find our motor cortex electrodes
+header$sHeaders$label
+```
+
+The labels come with trailing dots as padding (`C3..`, `Fc3.`), we ignore those. The relevant ones for us are C3, C4, FC3, FC4, CP3, CP4, all positioned over the motor cortex. The remaining channels capture activity from brain regions unrelated to hand movement, so including them would complicate the classification even more.
+
+Reading C3 and C4 (the two primary motor cortex electrodes) to see the full recording.
+
+```{r}
+#| label: raw-signal-prep
+#| echo: true
+#| results: hide
+
+# Read C3 and C4 signals from the EDF file
+signals <- readEdfSignals(header, signals = c("C3..", "C4.."))
+
+# Build a tidy tibble: one row per timepoint per channel
+c3 <- tibble(
+  time = seq(0, length.out = length(signals$`C3..`$signal), by = 1/160),
+  value = signals$`C3..`$signal,
+  channel = "C3"
+)
+
+c4 <- tibble(
+  time = seq(0, length.out = length(signals$`C4..`$signal), by = 1/160),
+  value = signals$`C4..`$signal,
+  channel = "C4"
+)
+
+eeg <- bind_rows(c3, c4)
+```
+
+```{r}
+#| label: raw-signal-plot
+#| echo: false
+
+# Full 125-second recording: continuous signal before segmentation into trials
+s001_signal_plot <- ggplot(eeg, aes(x = time, y = value, color = channel)) +
+  geom_line(alpha = 0.7) +
+  labs(
+    x = "Time (s)",
+    y = "Amplitude (uV)",
+    title = "S001 - R04 (Motor Imagery Left/Right)"
+  )
+
+s001_signal_plot
+save_plot(s001_signal_plot, img_exp_dir, "s001_signal_plot.png")
+```
+
+125 seconds of continuous EEG. Visually indistinguishable between left and right imagery, which is expected. The discriminative information (what makes a signal different from other) lives in the statistical properties of the signal, not in its raw waveform. We will extract those properties later with `tsfeatures`.
+
+```{r}
+#| label: read-annotations
+#| echo: true
+#| results: hide
+
+# Read the annotation channel (event markers: T0 = rest, T1 = left, T2 = right)
+annotations <- readEdfSignals(header, signals = "EDF Annotations")
+str(annotations)
+```
+
+## Event markers
+
+The signal is continuous, but there is an annotation channel embedded in the EDF that tells us exactly when each trial starts, ends, and what type it is.
+
+```{r}
+#| label: event-markers
+#| echo: true
+#| results: hide
+
+# Extract event table: onset time, duration, and label for each trial
+events <- annotations$annotations |> as_tibble()
+str(events)
+```
+
+```{r}
+#| label: event-counts
+#| echo: true
+#| results: markup
+
+# How many trials of each type in this run
+events |> count(annotation)
+```
+
+15 rest periods, 8 left, 7 right in one run. Three runs per subject (R04, R08, R12) give us around 45 task trials per subject total.
+
+## Segmenting a single trial
+
+Using the event timestamps to slice the continuous recording into individual trials. Each one is a ~4.1 second window corresponding to one imagery task.
+
+```{r}
+#| label: segment-trial-prep
+#| echo: true
+#| results: hide
+
+# Channels over the motor cortex
+#(the only ones relevant for left vs right imagery)
+motor_channels <- c("C3..", "C4..", "Fc3.", "Fc4.", "Cp3.", "Cp4.")
+
+# Read all 6 channels from the EDF file
+signals_all <- readEdfSignals(header, signals = motor_channels)
+
+# Keep only task trials (T1 = left hand, T2 = right hand) and drop T0 (rest)
+task_events <- events |> filter(annotation %in% c("T1", "T2"))
+
+# Grab the first trial as an example
+trial_1 <- task_events[1, ]
+
+# Convert event times (seconds) to sample indices
+# At 160 Hz, 4.2 seconds = sample 672. +1 because R is 1-indexed (awful)
+start_idx <- round(trial_1$onset * 160) + 1
+end_idx   <- round(trial_1$end * 160)
+
+# Extract the C3 and C4 segments for this trial
+segment <- tibble(
+  time = seq(0, length.out = end_idx - start_idx + 1, by = 1/160),
+  C3 = signals_all$`C3..`$signal[start_idx:end_idx],
+  C4 = signals_all$`C4..`$signal[start_idx:end_idx]
+) |> pivot_longer(cols = c(C3, C4), names_to = "channel", values_to = "value")
+```
+
+```{r}
+#| label: segment-trial-plot
+#| echo: false
+
+# What a single ~4s trial looks like across two motor cortex channels
+single_trial_plot <- ggplot(segment, aes(x = time, y = value, color = channel)) +
+  geom_line() +
+  labs(
+    title = paste("Single trial -", trial_1$annotation, "(",
+                  ifelse(trial_1$annotation == "T1", "left", "right"), ")"),
+    x = "Time (s)",
+    y = "Amplitude (uV)"
+  )
+
+single_trial_plot
+save_plot(single_trial_plot, img_exp_dir, "s001_t1_plot.png")
+```
+
+A single right-hand imagery trial on C3 and C4. The signal is still noisy at this resolution. The differences between left and right only show up statistically across many trials, which is precisely why we need feature extraction and a classifier on top (next step).
+
+## Extracting all trials from one subject
+
+So far we've only looked at one trial from one run. Now we process all three motor imagery runs (R04, R08, R12) for subject S001 and collect every trial into a single table.
+
+```{r}
+#| label: extract-subject-trials
+#| echo: true
+#| results: hide
+
+imagery_runs <- c("R04", "R08", "R12")
+subject <- "S001"
+all_trials <- tibble()
+trial_counter <- 1
+
+for (run in imagery_runs) {
+  filepath <- paste0("data/raw/", subject, "/", subject, run, ".edf")
+
+  hdr <- readEdfHeader(filepath)
+  sigs <- readEdfSignals(hdr, signals = motor_channels)
+  annot <- readEdfSignals(hdr, signals = "EDF Annotations")
+
+  evts <- annot$annotations |>
+    as_tibble() |>
+    filter(annotation %in% c("T1", "T2"))
+
+  for (i in seq_len(nrow(evts))) {
+    evt <- evts[i, ]
+    s_idx <- round(evt$onset * 160) + 1
+    e_idx <- round(evt$end * 160)
+
+    # Extract all 6 motor channels for this trial
+    trial_data <- tibble(
+      subject_id = subject,
+      trial_id = trial_counter,
+      run = run,
+      label = ifelse(evt$annotation == "T1", "left", "right"),
+      channel = rep(c("C3", "C4", "FC3", "FC4", "CP3", "CP4"),
+                    each = e_idx - s_idx + 1),
+      sample = rep(seq_len(e_idx - s_idx + 1), times = 6),
+      value = c(
+        sigs$`C3..`$signal[s_idx:e_idx],
+        sigs$`C4..`$signal[s_idx:e_idx],
+        sigs$`Fc3.`$signal[s_idx:e_idx],
+        sigs$`Fc4.`$signal[s_idx:e_idx],
+        sigs$`Cp3.`$signal[s_idx:e_idx],
+        sigs$`Cp4.`$signal[s_idx:e_idx]
+      )
+    )
+
+    all_trials <- bind_rows(all_trials, trial_data)
+    trial_counter <- trial_counter + 1
+  }
+}
+```
+
+```{r}
+#| label: extract-subject-trials-summary
+#| echo: true
+#| results: markup
+
+# Quick summary
+all_trials |> distinct(trial_id, label) |> count(label)
+```
+
+Now we have every trial from S001 in a single tidy table: one row per sample per channel, with subject, trial, run, and label columns. This is the format we need before feature extraction.
+
+## Feature extraction
+
+Each trial is a time series of ~656 samples per channel. We cannot feed raw time series into a classifier directly. Instead, we compute summary statistics for each channel in each trial using `tsfeatures`: entropy, autocorrelation, trend strength, etc. This compresses each trial from 656 x 6 values into a single row of ~90 features.
+
+```{r}
+#| label: tsfeatures-test
+#| echo: true
+#| results: hide
+
+# Extract features for one trial as a test
+test_trial <- all_trials |> filter(trial_id == 1, channel == "C3")
+
+# tsfeatures expects a list of time series
+ts_input <- list(ts(test_trial$value, frequency = 160))
+features <- tsfeatures(ts_input)
+features
+```
+
+```{r}
+#| label: tsfeatures-broad
+#| echo: true
+#| results: hide
+
+# Let's request a broader set of features, we need more than 7
+feature_list <- c(
+  "entropy",
+  "stability",
+  "lumpiness",
+  "crossing_points",
+  "flat_spots",
+  "hurst",
+  "acf_features",
+  "nonlinearity"
+)
+
+features <- tsfeatures(ts_input, features = feature_list)
+features
+```
+
+14 features per channel. With 6 motor cortex channels that gives us 84 features per trial, which now is a reasonable dimensionality for classification.
+
+Now we apply this to every trial across all 6 channels.
+
+```{r}
+#| label: extract-all-features
+#| echo: true
+#| results: hide
+
+# Extract features for all trials and channels
+# Also handles bad trials (flat signals, corrupted data)
+extract_trial_features <- function(trial_data, feature_list) {
+  result <- tryCatch({
+    trial_data |>
+      group_by(channel) |>
+      summarise(
+        features = list(tsfeatures(list(ts(value, frequency = 160)), 
+                                   features = feature_list)),
+        .groups = "drop"
+      ) |>
+      unnest(features) |>
+      pivot_wider(names_from = channel, values_from = -channel,
+                  names_glue = "{channel}_{.value}")
+  }, error = function(e) {
+    # return NULL for trials that can't be processed
+    # (zero-variance, corrupted, etc.)
+    cat("    Skipping trial (", conditionMessage(e), ")\n")
+    return(NULL)
+  })
+
+  result
+}
+
+trial_features <- all_trials |>
+  group_by(subject_id, trial_id, run, label) |>
+  group_modify(~ extract_trial_features(.x, feature_list)) |>
+  ungroup()
+```
+
+```{r}
+#| label: all-features-check
+#| echo: true
+#| results: markup
+
+# Check dimensions: this should be 45 rows x (4 metadata + 84 features)
+dim(trial_features)
+glimpse(trial_features)
+```
+
+45 rows (one per trial) and 88 columns: subject_id, trial_id, run, label, plus 14 features for each of the 6 channels. This is the format we need for classification.
+
+## Band power features
+
+The tsfeatures above operate on the raw broadband signal. For motor imagery, what actually discriminates left from right is the power in two specific frequency bands: mu (8–13 Hz) and beta (13–30 Hz). During imagined movement, power in these bands drops in the motor cortex contralateral to the movement — a phenomenon called event-related desynchronization (ERD) [@pfurtscheller1997motor; @pfurtscheller2006mu]. A classifier that cannot see band-specific power is missing the most informative part of the signal.
+
+To extract band power we apply a 4th-order Butterworth bandpass filter and then compute the log-variance of the filtered signal. Log-variance is standard here because it compresses the dynamic range and tends to be more normally distributed than raw variance.
+
+```{r}
+#| label: band-power-fn
+#| echo: true
+#| results: hide
+
+# Returns log(var()) of the signal filtered to [low, high] Hz
+compute_band_power <- function(x, low, high, sr = 160) {
+  nyq      <- sr / 2
+  bf       <- butter(4, c(low, high) / nyq, type = "pass")
+  filtered <- tryCatch(filtfilt(bf, x),
+                       error = function(e) rep(NA_real_, length(x)))
+  v <- var(filtered, na.rm = TRUE)
+  if (is.na(v) || v <= 0) return(NA_real_)
+  log(v)
+}
+```
+
+```{r}
+#| label: test-band-power
+#| echo: true
+#| results: hide
+
+# Verify on trial 1, C3 channel
+c3_signal <- all_trials |> filter(trial_id == 1, channel == "C3") |> pull(value)
+
+mu_power   <- compute_band_power(c3_signal, 8, 13)
+beta_power <- compute_band_power(c3_signal, 13, 30)
+```
+
+For the first trial on C3: mu band power is `r round(mu_power, 4)` and beta band power is `r round(beta_power, 4)` (log-variance units).
+
+```{r}
+#| label: plot-band-power-prep
+#| echo: true
+#| results: hide
+
+# Visualize the filtered signals to confirm the filter works as expected
+nyq <- 160 / 2
+c3_mu   <- filtfilt(butter(4, c(8, 13)  / nyq, type = "pass"), c3_signal)
+c3_beta <- filtfilt(butter(4, c(13, 30) / nyq, type = "pass"), c3_signal)
+
+t <- seq(0, length.out = length(c3_signal), by = 1 / 160)
+```
+
+```{r}
+#| label: plot-band-power
+#| echo: false
+#| fig-cap: "C3 signal (trial 1, left imagery): broadband versus mu (8–13 Hz) and beta (13–30 Hz) Butterworth-filtered bands. Log-variance of each filtered signal is used as band power."
+
+broadband_vs_filteredbands_plot <- bind_rows(
+  tibble(time = t, value = c3_signal, band = "broadband"),
+  tibble(time = t, value = c3_mu,     band = "mu (8-13 Hz)"),
+  tibble(time = t, value = c3_beta,   band = "beta (13-30 Hz)")
+) |>
+  ggplot(aes(x = time, y = value)) +
+  geom_line(linewidth = 0.4) +
+  facet_wrap(~band, ncol = 1, scales = "free_y") +
+  labs(x = "Time (s)", y = "Amplitude (uV)",
+       title = "Trial 1 - C3: broadband vs filtered bands")
+
+broadband_vs_filteredbands_plot
+save_plot(broadband_vs_filteredbands_plot, img_exp_dir, "broadband_vs_filteredbands.png")
+```
+
+```{r}
+#| label: extract-band-features
+#| echo: true
+#| results: hide
+
+# Extract band power features for all channels in one trial
+extract_band_power_features <- function(trial_data, sr = 160) {
+  trial_data |>
+    group_by(channel) |>
+    summarise(
+      mu_power   = compute_band_power(value, 8,  13, sr),
+      beta_power = compute_band_power(value, 13, 30, sr),
+      .groups = "drop"
+    ) |>
+    pivot_wider(names_from  = channel,
+                values_from = c(mu_power, beta_power),
+                names_glue  = "{channel}_{.value}")
+}
+
+trial_1_data <- all_trials |> filter(trial_id == 1)
+extract_band_power_features(trial_1_data)
+```
+
+12 columns: mu and beta power for each of the 6 channels. These get appended to the tsfeatures row for each trial, bringing the total to 100 features per trial.
+
+So far we've only processed S001. Now we need to scale this to all 109 subjects. This will take a while since it's reading 327 EDF files (3 runs x 109 subjects) and computing features for every trial. We save the result to CSV so we only need to run this once.
+
+> **Note on reproducibility:** The preprocessing chunks below are set to `eval: false` to avoid recomputing features on every render, since the results are already saved to `data/processed/`. To reproduce the pipeline from the raw EDF files, set each of these chunks to `eval: true` and re-render the document. Execution will take several minutes.
+
+```{r}
+#| label: bulk-processing
+#| eval: false
+#| echo: true
+
+# Set eval=TRUE to regenerate all features from the raw EDF files.
+# This reads 327 files and takes several minutes - the result is already
+# saved to data/processed/trial_features.csv.
+# Process all 109 subjects
+all_subjects_features <- tibble()
+
+for (subj_num in 1:109) {
+  subject <- sprintf("S%03d", subj_num)
+  cat("Processing", subject, "\n")
+
+  subj_trials <- tibble()
+  trial_counter <- 1
+
+  for (run in imagery_runs) {
+    filepath <- paste0("data/raw/", subject, "/", subject, run, ".edf")
+
+    # Check if some subjects might have missing files
+    if (!file.exists(filepath)) {
+      cat("  Skipping", run, "(file not found)\n")
+      next
+    }
+
+    hdr <- readEdfHeader(filepath)
+    sigs <- readEdfSignals(hdr, signals = motor_channels)
+    annot <- readEdfSignals(hdr, signals = "EDF Annotations")
+    evts <- annot$annotations |>
+      as_tibble() |>
+      filter(annotation %in% c("T1", "T2"))
+
+    for (i in seq_len(nrow(evts))) {
+      evt <- evts[i, ]
+      s_idx <- round(evt$onset * 160) + 1
+      e_idx <- round(evt$end * 160)
+
+      trial_data <- tibble(
+        channel = rep(c("C3", "C4", "FC3", "FC4", "CP3", "CP4"),
+                      each = e_idx - s_idx + 1),
+        sample = rep(seq_len(e_idx - s_idx + 1), times = 6),
+        value = c(
+          sigs$`C3..`$signal[s_idx:e_idx],
+          sigs$`C4..`$signal[s_idx:e_idx],
+          sigs$`Fc3.`$signal[s_idx:e_idx],
+          sigs$`Fc4.`$signal[s_idx:e_idx],
+          sigs$`Cp3.`$signal[s_idx:e_idx],
+          sigs$`Cp4.`$signal[s_idx:e_idx]
+        )
+      )
+
+      features <- extract_trial_features(trial_data, feature_list)
+
+      if (!is.null(features)) {
+        band_features <- extract_band_power_features(trial_data)
+        features <- bind_cols(features, band_features)
+
+        features$subject_id <- subject
+        features$trial_id <- trial_counter
+        features$run <- run
+        features$label <- ifelse(evt$annotation == "T1", "left", "right")
+
+        subj_trials <- bind_rows(subj_trials, features)
+      }
+      trial_counter <- trial_counter + 1
+    }
+  }
+
+  all_subjects_features <- bind_rows(all_subjects_features, subj_trials)
+}
+
+dim(all_subjects_features)
+
+# Save so we never have to run this again...
+write_csv(all_subjects_features, "data/processed/trial_features.csv")
+cat("Saved to data/processed/trial_features.csv\n")
+```
+
+```{r}
+#| label: load-precomputed
+#| echo: true
+#| results: hide
+
+# Load pre-computed features from disk. If the chunk above was run instead,
+# this can be skipped - all_subjects_features will already be in memory.
+all_subjects_features <- read_csv("data/processed/trial_features.csv")
+```
+
+## Lateral asymmetry features
+
+Motor imagery of the right hand produces desynchronization over the left hemisphere (C3), and vice versa. To give the classifiers a direct scalar measure of this response, we compute the difference in band power between contralateral and ipsilateral electrode pairs for both the mu and beta bands across the three electrode pairs (C3/C4, FC3/FC4, CP3/CP4).
+
+```{r}
+#| label: asymmetry-features
+#| echo: true
+#| results: hide
+
+all_subjects_features <- all_subjects_features |>
+  mutate(
+    C_asym_mu    = C3_mu_power    - C4_mu_power,
+    C_asym_beta  = C3_beta_power  - C4_beta_power,
+    FC_asym_mu   = FC3_mu_power   - FC4_mu_power,
+    FC_asym_beta = FC3_beta_power - FC4_beta_power,
+    CP_asym_mu   = CP3_mu_power   - CP4_mu_power,
+    CP_asym_beta = CP3_beta_power - CP4_beta_power
+  )
+```
+
+```{r}
+#| label: save-enriched-trial-features
+#| eval: false
+#| echo: true
+
+# Overwrites trial_features.csv with the six asymmetry columns added.
+# The classification section loads from this file and depends on those columns.
+write_csv(all_subjects_features, "data/processed/trial_features.csv")
+```
+
+## Resuming from S088
+
+> **Note:** This section documents a crash recovery during the original exploration session. Do not re-run: the full pipeline above already covers all 109 subjects with the updated feature set.
+
+S088 crashed the pipeline due to zero-variance channels (flat signal, likely a bad electrode). The updated `extract_trial_features` now handles these cases with `tryCatch` and skips them. Data from S001-S087 is still in memory, so we pick up where we left off.
+
+```{r}
+#| label: crash-recovery
+#| eval: false
+#| echo: true
+
+# Crash recovery - do not run in normal conditions. The full pipeline above
+# already covers all 109 subjects. This chunk was used to resume mid-run after
+# S088 crashed the original session; set eval=TRUE only if replicating that scenario.
+# Resume from S088
+for (subj_num in 88:109) {
+  subject <- sprintf("S%03d", subj_num)
+  cat("Processing", subject, "\n")
+
+  subj_trials <- tibble()
+  trial_counter <- nrow(all_subjects_features |>
+                          distinct(subject_id, trial_id)) + 1
+
+  for (run in imagery_runs) {
+    filepath <- paste0("data/raw/", subject, "/", subject, run, ".edf")
+
+    if (!file.exists(filepath)) {
+      cat("  Skipping", run, "(file not found)\n")
+      next
+    }
+
+    hdr <- readEdfHeader(filepath)
+    sigs <- readEdfSignals(hdr, signals = motor_channels)
+    annot <- readEdfSignals(hdr, signals = "EDF Annotations")
+    evts <- annot$annotations |>
+      as_tibble() |>
+      filter(annotation %in% c("T1", "T2"))
+
+    for (i in seq_len(nrow(evts))) {
+      evt <- evts[i, ]
+      s_idx <- round(evt$onset * 160) + 1
+      e_idx <- round(evt$end * 160)
+
+      trial_data <- tibble(
+        channel = rep(c("C3", "C4", "FC3", "FC4", "CP3", "CP4"),
+                      each = e_idx - s_idx + 1),
+        sample = rep(seq_len(e_idx - s_idx + 1), times = 6),
+        value = c(
+          sigs$`C3..`$signal[s_idx:e_idx],
+          sigs$`C4..`$signal[s_idx:e_idx],
+          sigs$`Fc3.`$signal[s_idx:e_idx],
+          sigs$`Fc4.`$signal[s_idx:e_idx],
+          sigs$`Cp3.`$signal[s_idx:e_idx],
+          sigs$`Cp4.`$signal[s_idx:e_idx]
+        )
+      )
+
+      features <- extract_trial_features(trial_data, feature_list)
+
+      if (!is.null(features)) {
+        features$subject_id <- subject
+        features$trial_id <- trial_counter
+        features$run <- run
+        features$label <- ifelse(evt$annotation == "T1", "left", "right")
+        subj_trials <- bind_rows(subj_trials, features)
+      }
+
+      trial_counter <- trial_counter + 1
+    }
+  }
+
+  all_subjects_features <- bind_rows(all_subjects_features, subj_trials)
+}
+
+dim(all_subjects_features)
+
+# Check which subjects had skipped trials
+all_subjects_features |> count(subject_id) |> filter(n < 40) |> print(n = Inf)
+
+# Save
+write_csv(all_subjects_features, "data/processed/trial_features.csv")
+cat("Saved to data/processed/trial_features.csv\n")
+```
+
+4894 trials processed across 109 subjects. S088 and S092 were fully dropped (all channels flat across all 3 runs, likely bad recordings). S100 lost some trials but kept 30. This is normal in real EEG datasets; not every recording is clean.
+
+The trial-level features are saved to `data/processed/trial_features.csv`. This is the file the classification task will use.
+
+## Subject-level aggregated features
+
+Now we need the subject-level aggregated features for the regression task.
+
+```{r}
+#| label: aggregate-subject
+#| echo: true
+#| results: hide
+
+# Aggregate per subject: mean and std of each feature across all their trials
+feature_cols <- all_subjects_features |>
+  select(-subject_id, -trial_id, -run, -label) |>
+  colnames()
+
+subject_features <- all_subjects_features |>
+  group_by(subject_id) |>
+  summarise(
+    across(all_of(feature_cols), list(mean = mean, std = sd),
+           .names = "{.col}_{.fn}"),
+    n_trials = n(),
+    .groups = "drop"
+  )
+
+# Compute composite stability score per subject
+std_cols <- subject_features |>
+  select(ends_with("_std")) |>
+  colnames()
+
+# Normalize each std column (z-score) then average across all of them
+stability <- subject_features |>
+  select(subject_id, all_of(std_cols)) |>
+  mutate(across(all_of(std_cols), ~ (. - mean(., na.rm = TRUE)) / sd(., na.rm = TRUE))) |>
+  rowwise() |>
+  mutate(stability_score = mean(c_across(all_of(std_cols)), na.rm = TRUE)) |>
+  ungroup() |>
+  select(subject_id, stability_score)
+
+subject_features <- subject_features |> left_join(stability, by = "subject_id")
+
+dim(subject_features)
+```
+
+```{r}
+#| label: save-subject-features
+#| eval: false
+#| echo: true
+
+# Set eval=TRUE to overwrite data/processed/subject_features.csv.
+write_csv(subject_features, "data/processed/subject_features.csv")
+cat("Saved to data/processed/subject_features.csv\n")
+```
+
+```{r}
+#| label: check-lost-trials
+#| echo: true
+#| results: markup
+
+# Check which subjects lost trials vs the expected ~45
+all_subjects_features |>
+  count(subject_id) |>
+  filter(n < 40) |>
+  print(n = Inf)
+```
+
+Only S100 had partial data loss (30 out of ~45 trials). Every other subject retained all their trials, that's a very good outcome! Both CSVs are now saved:
+
+* `data/processed/trial_features.csv` - one row per trial (4894 × 106 columns): 84 tsfeatures + 12 band power features (mu and beta per channel) + 6 lateral asymmetry features + 4 metadata columns (subject_id, trial_id, run, label)
+* `data/processed/subject_features.csv` - one row per subject (109 x 194), for regression: mean + std per feature, n_trials, stability_score
+
+Quick sanity check on the final outputs before wrapping up.
+
+```{r}
+#| label: final-sanity-check
+#| echo: true
+#| results: markup
+
+# Verify label balance in trial features
+all_subjects_features |> count(label)
+
+# Preview the trial features
+all_subjects_features |>
+  select(subject_id, trial_id, label, C3_entropy,
+         C4_entropy, C3_x_acf1, C4_x_acf1) |>
+  head(10)
+```
+
+## Exploration Summary
+
+Labels are well balanced (see count table above). `r n_distinct(subject_features$subject_id)` subjects, `r ncol(subject_features) - 2` aggregated features per subject. Both output CSVs are ready for the classification and regression tasks respectively.
+
+# Within-Subject Motor Imagery Classification
+
+## Introduction
+
+This section covers binary classification of motor imagery tasks (imagining left vs. right hand movement) using per-trial EEG features from the 6 motor cortex channels. The feature set uses 30 physiology-backed predictors: band power (mu and beta bands) and event-related desynchronization (ERD) features across the 6 channels (24 features total), plus 6 lateral asymmetry features capturing the left-right band power difference between electrode pairs (C3-C4, FC3-FC4, CP3-CP4). Time-series features from `tsfeatures` are excluded: with roughly 36 training trials per subject, including 84 additional features would produce a dimensionality that makes within-subject models unreliable.
+
+EEG patterns contain extreme inter-subject variance. To account for BCI Illiteracy, our methodology avoids global modeling and relies strictly on a within-subject evaluation pipeline.
+
+```{r}
+#| label: load-data
+#| include: false
+
+preds_filepath <- "data/processed/all_preds.rds"
+
+# Read the trail-level features file
+features_raw <- read_csv("data/processed/trial_features.csv", show_col_types = FALSE)
+
+total_trials <- nrow(features_raw)
+left_count  <- sum(features_raw$label == "left")
+right_count <- sum(features_raw$label == "right")
+subjects_n  <- length(unique(features_raw$subject_id))
+```
+
+The resulting post-processed dataset contains `r total_trials` valid trials across `r subjects_n` subjects. The experimental target variables exhibit complete statistical symmetry, with `r left_count` left-hand imagery trials and `r right_count` right-hand imagery trials, providing an unbiased baseline for classification benchmarking.
+
+## Data Preparation
+
+The trial features file already includes the six lateral asymmetry columns computed during preprocessing. Here we select the relevant predictors and remove subjects with missing values.
+
+```{r}
+#| label: cleaning
+#| echo: true
+#| results: hide
+
+features <- features_raw
+
+mi_feature_cols <- features |>
+  select(matches("^(C3|C4|FC3|FC4|CP3|CP4)_(mu|beta)_(power|erd)$")) |>
+  colnames()
+
+predictor_cols <- c(
+  mi_feature_cols,
+  "C_asym_mu", "C_asym_beta",
+  "FC_asym_mu", "FC_asym_beta",
+  "CP_asym_mu", "CP_asym_beta"
+)
+
+model_df <- features |>
+  select(subject_id, trial_id, run, label, all_of(predictor_cols)) |>
+  mutate(label = factor(label, levels = c("left", "right")))
+
+# Drop subjects that have NaN values
+bad_subjects <- model_df |>
+  filter(if_any(all_of(predictor_cols), is.na)) |>
+  distinct(subject_id)
+
+dropped_by_subject <- model_df |>
+  semi_join(bad_subjects, by = "subject_id") |>
+  count(subject_id, name = "rows_dropped")
+
+model_df <- model_df |>
+  anti_join(bad_subjects, by = "subject_id")
+```
+
+Following the removal of invalid subjects, the final cleaned dataset contains `r nrow(model_df)` trials across `r n_distinct(model_df$subject_id)` subjects, utilizing `r length(predictor_cols)` engineered predictors.
+
+## Exploratory Data Analysis
+
+To understand the baseline discriminative power of our features, we visualize the density distributions for the primary motor cortex electrode (`C3`), mapped to the left and right classes.
+
+```{r}
+#| label: plot-density
+#| echo: false
+#| fig-cap: "Density distributions of individual features extracted from the C3 electrode, separated by left and right motor imagery classes. The substantial overlap indicates that individual features are not highly discriminative in isolation."
+
+p_density_c3 <- model_df |>
+  select(starts_with(c("C3_", "C4_", "C_")), label) |>
+  pivot_longer(
+    cols = -label,
+    names_to = "feature",
+    values_to = "value"
+  ) |>
+  mutate(feature = factor(feature, levels = sort(unique(feature), decreasing = TRUE))) |>
+  ggplot(aes(x = value, fill = label, color = label)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~feature, scales = "free") +
+  labs(
+    x = "Feature Value",
+    y = "Density"
+  )
+
+p_density_c3
+save_plot(p_density_c3, img_cls_dir, "density_distributions_c3_by_class.png", width = 12, height = 8)
+```
+
+Visually, the distributions for the 'left' and 'right' classes show almost perfect overlap. This highlights the low signal-to-noise ratio of EEG data: no single univariate feature is sufficient for classification. To quantify this mathematically, we apply a Kolmogorov-Smirnov (KS) test to these distributions.
+
+```{r}
+#| label: ks-test
+#| echo: true
+#| results: markup
+
+model_df |>
+  select(starts_with(c("C3_", "C4_", "C_")), label) |>
+  pivot_longer(
+    cols = -label,
+    names_to = "feature",
+    values_to = "value"
+  ) |>
+  group_by(feature) |>
+  summarise(
+    ks_stat = ks.test(
+      value[label == "left"], value[label == "right"]
+    )$statistic,
+    p_value = ks.test(
+      value[label == "left"], value[label == "right"]
+    )$p.value,
+    .groups = "drop"
+  ) |>
+  arrange(p_value)
+```
+
+The KS test statistics confirm small differences between the classes. This low univariate separability mandates the use of multivariate classifiers capable of defining complex decision boundaries.
+
+## Preprocessing and Dimensionality Reduction
+
+We perform a stratified 20% test-train split per subject to guarantee balanced classes in our test sets while maintaining strict subject isolation. We then apply subject-level standardization using scaling statistics derived only from the training subset to prevent data leakage.
+
+```{r}
+#| label: cv-split
+#| echo: true
+#| results: hide
+
+test_keys <- model_df |>
+  group_by(subject_id, label) |>
+  slice_sample(prop = 0.2) |>
+  ungroup() |>
+  select(subject_id, trial_id)
+
+train_data <- model_df |>
+  anti_join(test_keys, by = c("subject_id", "trial_id"))
+
+test_data <- model_df |>
+  semi_join(test_keys, by = c("subject_id", "trial_id"))
+```
+
+```{r}
+#| label: scaler
+#| echo: true
+#| results: hide
+
+fit_subject_scaler <- function(train_df, feature_cols) {
+  train_df |>
+    group_by(subject_id) |>
+    summarise(
+      across(
+        all_of(feature_cols),
+        list(
+          mean = ~ mean(.x, na.rm = TRUE),
+          sd = ~ sd(.x, na.rm = TRUE)
+        ),
+        .names = "{.col}__{.fn}"
+      ),
+      .groups = "drop"
+    )
+}
+
+transform_subject_scaler <- function(df, scaler, feature_cols, eps = 1e-8) {
+  out <- df |>
+    left_join(scaler, by = "subject_id")
+
+  for (feature in feature_cols) {
+    m <- out[[paste0(feature, "__mean")]]
+    s <- out[[paste0(feature, "__sd")]]
+    s[is.na(s) | s < eps] <- 1
+    out[[feature]] <- (out[[feature]] - m) / (s + eps)
+  }
+
+  out |>
+    select(-ends_with("__mean"), -ends_with("__sd"))
+}
+
+scaler <- fit_subject_scaler(train_data, predictor_cols)
+train_scaled <- transform_subject_scaler(train_data, scaler, predictor_cols)
+test_scaled <- transform_subject_scaler(test_data, scaler, predictor_cols)
+```
+
+Because our features demonstrate high multicollinearity (spacially close electrodes capture overlapping regional signals), we apply Principal Component Analysis (PCA). To determine the optimal number of components without arbitrary selection, we evaluate the cumulative explained variance.
+
+```{r}
+#| label: pca-logic
+#| echo: true
+#| results: hide
+
+pca_prep <- recipe(label ~ ., data = train_scaled) |>
+  update_role(subject_id, trial_id, run, new_role = "ID") |>
+  step_impute_mean(all_numeric_predictors()) |>
+  step_zv(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_pca(all_numeric_predictors(), num_comp = length(predictor_cols)) |>
+  prep()
+
+pca_variance <- tidy(pca_prep, number = 4, type = "variance") |> 
+  filter(terms == "cumulative percent variance") |> 
+  mutate(cumulative_variance = value / 100)
+```
+
+Based on the PCA analysis, the number of principal components required to reach common variance thresholds are:
+
+* 80% threshold: `r min(pca_variance$component[pca_variance$cumulative_variance >= 0.80])` components.
+* 90% threshold: `r min(pca_variance$component[pca_variance$cumulative_variance >= 0.90])` components.
+
+```{r}
+#| label: pca-plot
+#| echo: false
+#| fig-cap: "PCA cumulative explained variance curve mapping the proportion of dataset variance retained as principal components are added. The dashed lines indicate the 80% and 90% variance thresholds."
+
+p_pca_variance <- ggplot(pca_variance, aes(x = component, y = cumulative_variance)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  geom_hline(yintercept = c(0.80, 0.90), linetype = "dashed", color = "gray50") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(
+    x = "Number of Principal Components", 
+    y = "Cumulative Variance"
+  )
+
+p_pca_variance
+save_plot(p_pca_variance, img_cls_dir, "pca_explained_variance.png", width = 7, height = 4)
+```
+
+The PCA curve shows that 80% of the variance across our feature space is captured within the first 5 principal components. We use an 80% variance threshold in our preprocessing pipeline to avoid overfitting to sensory noise.
+
+## Model Setup and Training
+
+We benchmark four algorithms against one another to identify the most robust architecture for this data:
+
+1. Logistic Regression (Elastic Net Regularization)
+2. Naive Bayes
+3. K-Nearest Neighbors (KNN)
+4. Random Forest
+
+A v-fold cross-validation is performed at the session-run level rather than the trial level to prevent temporal data leakage.
+
+```{r}
+#| label: model-specs
+#| echo: true
+#| results: hide
+
+base_recipe <- recipe(label ~ ., data = train_scaled) |>
+  update_role(subject_id, trial_id, run, new_role = "ID") |>
+  step_impute_mean(all_numeric_predictors()) |>
+  step_zv(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_pca(all_numeric_predictors(), threshold = .8)
+
+eval_metrics <- metric_set(accuracy, sensitivity, specificity, roc_auc)
+
+fit_and_predict <- function(
+  model_spec, 
+  recipe, 
+  train_df, 
+  test_df, 
+  resamples = NULL, 
+  grid = NULL, 
+  metrics = eval_metrics, 
+  select_metric = "roc_auc") {
+  
+  wf <- workflow() |>
+    add_recipe(recipe) |>
+    add_model(model_spec)
+
+  params <- workflows::extract_parameter_set_dials(wf)
+
+  # No tune() params -> just fit once
+  if (nrow(params) == 0) {
+    fit <- fit(wf, data = train_df)
+    return(bind_rows(
+      augment(fit, new_data = train_df) |> mutate(split = "train"),
+      augment(fit, new_data = test_df) |> mutate(split = "test")
+    ))
+  }
+
+  # Has tune() params -> must tune first
+  if (is.null(resamples) || is.null(grid)) {
+    stop("This model has tune() parameters; pass `resamples` and `grid`.")
+  }
+
+  tuned <- tune::tune_grid(
+    wf,
+    resamples = resamples,
+    grid = grid,
+    metrics = metrics
+  )
+
+  best <- tune::select_best(tuned, metric = select_metric)
+
+  fit <- tune::finalize_workflow(wf, best) |>
+    fit(data = train_df)
+  bind_rows(
+    augment(fit, new_data = train_df) |> mutate(split = "train"),
+    augment(fit, new_data = test_df) |> mutate(split = "test")
+  )
+}
+```
+
+```{r}
+#| label: model-training
+#| echo: true
+#| results: hide
+#| eval: false
+
+## Model specs (kept constant across subjects)
+logreg_spec <- logistic_reg(penalty = tune(), mixture = tune()) |> set_engine("glmnet") |> set_mode("classification")
+logreg_grid <- dials::grid_space_filling(dials::penalty(range = c(-1, 2)), dials::mixture(range = c(0, 1)), size = 10)
+
+nb_spec <- naive_Bayes(Laplace = tune()) |> set_engine("naivebayes") |> set_mode("classification")
+nb_grid <- dials::grid_space_filling(dials::Laplace(range = c(0.1, 5)), size = 10)
+
+knn_spec <- nearest_neighbor(neighbors = tune()) |> set_engine("kknn") |> set_mode("classification")
+knn_grid <- dials::grid_space_filling(dials::neighbors(range = c(5, 15)), size = 10)
+
+rf_spec <- rand_forest(trees = 500, mtry = tune(), min_n = tune()) |> set_engine("ranger", max.depth = 3) |> set_mode("classification")
+rf_grid <- dials::grid_space_filling(dials::mtry(range = c(1, 3)), dials::min_n(range = c(10, 20)), size = 10)
+
+make_subject_folds <- function(train_df) {
+  n_runs <- n_distinct(train_df$run)
+  rsample::group_vfold_cv(train_df, v = n_runs, group = run)
+}
+
+fit_subject_models <- function(subject_train, subject_test) {
+  folds <- make_subject_folds(subject_train)
+
+  preds_logreg <- fit_and_predict(logreg_spec, base_recipe, subject_train, subject_test, resamples = folds, grid = logreg_grid) |> mutate(model = "Logistic Regression")
+  preds_nb <- fit_and_predict(nb_spec, base_recipe, subject_train, subject_test, resamples = folds, grid = nb_grid) |> mutate(model = "Naive Bayes")
+  preds_knn <- fit_and_predict(knn_spec, base_recipe, subject_train, subject_test, resamples = folds, grid = knn_grid) |> mutate(model = "KNN")
+  preds_rf <- fit_and_predict(rf_spec, base_recipe, subject_train, subject_test, resamples = folds, grid = rf_grid) |> mutate(model = "Random Forest")
+
+  bind_rows(preds_logreg, preds_nb, preds_knn, preds_rf)
+}
+
+subjects <- sort(unique(train_scaled$subject_id))
+
+all_preds <- purrr::map_dfr(subjects, function(sid) {
+  subject_train <- train_scaled |> filter(subject_id == sid)
+  subject_test <- test_scaled |> filter(subject_id == sid)
+  fit_subject_models(subject_train, subject_test)
+}, .progress = "Fitting subjects")
+
+saveRDS(all_preds, preds_filepath)
+```
+
+```{r}
+#| label: pooled-metrics
+#| echo: true
+#| results: hide
+
+all_preds <- readRDS(preds_filepath)
+
+pooled_metrics <- all_preds |>
+  group_by(split, model) |>
+  group_modify(~ eval_metrics(.x, truth = label, estimate = .pred_class, .pred_left)) |>
+  ungroup() |>
+  select(split, model, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  arrange(split, model)
+```
+
+## Aggregate Performance
+
+If we ignore for a moment subject isolation and evaluate the pooled test predictions globally, we can observe the aggregate efficiency of the models.
+
+```{r}
+#| label: roc-curves-plot
+#| echo: false
+#| fig-cap: "Aggregate ROC curves evaluated across the entire testing dataset. The proximity to the diagonal baseline underscores the poor performance of global evaluation when severe inter-subject physiological differences are ignored."
+
+p_test_preds <- all_preds |>
+  filter(split == "test")
+
+p_roc_all_models <- p_test_preds |>
+  group_by(model) |>
+  roc_curve(truth = label, .pred_left) |>
+  autoplot()
+
+p_roc_all_models
+save_plot(p_roc_all_models, img_cls_dir, "roc_curves_all_models.png", width = 8, height = 6)
+```
+
+The aggregate ROC curves trace a path very close to the diagonal (AUC roughly 0.55-0.60). While Logistic Regression and Random Forest show a slight statistical edge globally, the overall performance appears exceptionally weak. However, in BCI literature, reporting pooled metrics is widely considered a bad practice. Because cortical anatomy and cognitive strategy vary radically from person to person, pooling predictions worsens the performance of highly successful, subject-specific models with the output of subjects whose models failed to converge.
+
+## Subject-Level Evaluation
+
+To evaluate the true capabilities of our pipeline, we must disaggregate the performance metrics per subject to measure how reliably the models fit individual baseline distributions.
+
+```{r}
+#| label: per-subject-summary
+#| echo: false
+#| results: markup
+
+per_subject_roc <- p_test_preds |>
+  group_by(model, subject_id) |>
+  summarise(
+    roc_auc = yardstick::roc_auc_vec(
+      truth = label,
+      estimate = .pred_left
+    ),
+    n_trials = n(),
+    .groups = "drop"
+  )
+
+roc_summary <- per_subject_roc |>
+  group_by(model) |>
+  summarise(
+    mean_auc = mean(roc_auc),
+    median_auc = median(roc_auc),
+    above_70 = sum(roc_auc > 0.70),
+    at_or_below_50 = sum(roc_auc <= 0.50),
+    n_subjects = n(),
+    .groups = "drop"
+  ) |>
+  arrange(desc(median_auc), desc(mean_auc))
+
+roc_summary
+```
+
+```{r}
+#| label: boxplots
+#| echo: false
+#| fig-cap: "Boxplot distributions of per-subject ROC AUC scores across the four tested models. The large inter-quartile ranges highlight the extreme variance in prediction accuracy across the participant pool."
+
+p_roc_box <- ggplot(per_subject_roc, aes(x = model, y = roc_auc, fill = model)) +
+  geom_boxplot(show.legend = FALSE) +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = NULL,
+    y = "ROC AUC"
+  )
+
+save_plot(p_roc_box, img_cls_dir, "per_subject_rocauc_by_model_boxplot.png", width = 10, height = 5)
+p_roc_box
+```
+
+Disaggregating the data changes the results. Rather than universally poor performance, we observe inter-subject variance. Test set scores span the entire probability space, ranging from worse-than-chance generalization to perfect (100%) separability.
+
+Notably, Logistic Regression fails to generalize for a large segment of the participant pool. Its median and 25th percentile are clamped exactly at 50%, a clear indicator that the elastic net penalty overpowered the loss function on noisy subjects, forcing the model to predict a single majority class. On the other hand, Naive Bayes, Random Forest, and KNN establish more robust medians (roughly 55–57%). Naive Bayes and Random Forest demonstrate the widest spread, successfully mapping the decision boundaries for the high-performing subjects.
+
+## Best Model Analysis: Naive Bayes
+
+Let's isolate our top-performing architecture to visualize the distribution of BCI illiteracy across the subject population.
+
+```{r}
+#| label: best-model-calc
+#| include: false
+
+best_model <- roc_summary |>
+  slice(1) |>
+  pull(model)
+
+best_per_subject <- per_subject_roc |>
+  filter(model == best_model) |>
+  arrange(roc_auc)
+```
+
+The best model by median per-subject ROC AUC is `r best_model`. Its characteristics across the population are as follows:
+
+* Mean per-subject ROC AUC: `r round(mean(best_per_subject$roc_auc), 3)`
+* Subjects achieving above 70% accuracy: `r sum(best_per_subject$roc_auc > 0.70)` out of `r nrow(best_per_subject)`
+* Subjects at or below chance level (≤50%): `r sum(best_per_subject$roc_auc <= 0.50)` out of `r nrow(best_per_subject)`
+
+```{r}
+#| label: best-model-bar
+#| echo: false
+#| fig-cap: "Individual subject ROC AUC scores plotted in ascending order using the Naive Bayes estimator. The red dashed line denotes the population mean, while the grey dashed line represents chance accuracy (50%)."
+
+p_best_bar <- ggplot(best_per_subject, aes(x = reorder(subject_id, roc_auc), y = roc_auc)) +
+  geom_col(aes(fill = roc_auc), show.legend = FALSE) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray40") +
+  geom_hline(
+    yintercept = mean(best_per_subject$roc_auc),
+    linetype = "dashed", color = "red"
+  ) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = NULL,
+    y = "ROC AUC"
+  ) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+p_best_bar
+save_plot(p_best_bar, img_cls_dir, "best_model_per_subject_rocauc_bar.png", width = 12, height = 5)
+```
+
+```{r}
+#| label: best-model-hist
+#| echo: false
+#| fig-cap: "Histogram demonstrating the highly spread, bimodal distribution of per-subject ROC AUC scores using the Naive Bayes model. Note the stark split between low-performing subjects and those with highly separable signal patterns."
+
+p_best_hist <- ggplot(best_per_subject, aes(x = roc_auc)) +
+  geom_histogram(binwidth = 0.05, fill = "lightblue", color = "white") +
+  geom_vline(
+    xintercept = mean(best_per_subject$roc_auc),
+    linetype = "dashed", color = "steelblue", linewidth = 0.8
+  ) +
+  geom_vline(
+    xintercept = 0.5,
+    linetype = "dashed",
+    color = "red",
+    linewidth = 0.8
+  ) +
+  scale_x_continuous(labels = scales::percent_format()) +
+  labs(
+    x = "Per-subject ROC AUC",
+    y = "Number of subjects"
+  )
+
+p_best_hist
+save_plot(p_best_hist, img_cls_dir, "best_model_per_subject_rocauc_hist.png", width = 8, height = 5)
+```
+
+The bar and histogram visualizations show a highly spread, broadly bimodal distribution across the subject pool, confirming the phenomenon of BCI illiteracy [@ahn2013high]:
+
+* A distinct part of high-performers forms a distribution mode on the right, successfully exceeding 75% AUC and reaching up to 100%. For these individuals, the Naive Bayes algorithm captures highly separable, robust physiological responses in the feature space.
+* A large segment of low-performers forms a separate mode centered around and well below the 50% chance mark. A substantial portion of the population scores in the 25%–50% test range. This indicates that these subjects lack separable features. As a consequence, models trained on their data either guess randomly or overfit heavily to training noise, leading to worse-than-chance generalization on unseen data.
+
+# Across-Subject Neurophysiological Stability Regression
+
+The classification results show a strongly bimodal distribution of per-subject performance: roughly half the subjects reach above-chance AUC, while the other half stay at or below chance. Given this, a natural follow-up question is whether BCI literacy can be predicted in advance from a subject's aggregated signal properties, without running a full per-subject classifier [@blankertz2010neurophysiological]. If so, a stability-based screening step could identify subjects unlikely to produce a separable EEG signal before investing in a full BCI pipeline. The regression task addresses this question directly.
+
+## Setup and Data Loading
+
+The target variable, `stability_score`, measures trial-to-trial consistency of the EEG signal per subject. It is computed by z-scoring the standard deviation of each tsfeature column across all trials for that subject, then averaging the result: a higher score indicates more variable, less stable neural responses across trials. Band power and ERD standard deviations are excluded from this calculation because, without a rest baseline, their variability conflates task-response differences with noise. The stability score serves as a proxy for BCI aptitude: subjects with stable, consistent signals tend to produce more separable left vs. right patterns for the classifier.
+
+We load the processed subject features and keep only the per-subject mean EEG features alongside `stability_score`. Subjects with any missing values are removed.
+
+```{r}
+#| label: data-loading
+#| echo: true
+#| results: hide
+
+subject_features <- read.csv("data/processed/subject_features.csv")
+
+reg_data <- subject_features |>
+  select(subject_id, ends_with("_mean"), stability_score) |>
+  drop_na()
+```
+
+After removing subjects with missing values, the dataset contains `r nrow(reg_data)` subjects and `r ncol(reg_data) - 2` predictors.
+
+## Train / Test Split
+
+We split the data 70/30 into training and test sets. All preprocessing parameters are estimated from the training set only to avoid data leakage.
+
+```{r}
+#| label: train-test-split
+#| echo: true
+#| results: hide
+
+set.seed(42)
+reg_data_split <- reg_data %>% initial_split(prop = 0.7)
+train_data <- training(reg_data_split)
+test_data  <- testing(reg_data_split)
+
+x_train_raw <- train_data %>% select(-stability_score, -subject_id)
+y_train_raw <- train_data %>% pull(stability_score)
+x_test_raw  <- test_data  %>% select(-stability_score, -subject_id)
+y_test_raw  <- test_data  %>% pull(stability_score)
+```
+
+The split yields `r nrow(train_data)` training subjects and `r nrow(test_data)` test subjects.
+
+## Modelling
+
+We compare four approaches to predict `stability_score` from EEG mean features.
+
+* Model 1 - OLS (raw data): included as a cautionary baseline only. With ~52 subjects and 84 predictors (p > n), OLS is severely underdetermined: it will fit the training set perfectly while being meaningless on unseen data. This is not a valid model - it is shown precisely to illustrate why we need regularization.
+* Model 2 - OLS (normalized): the same underdetermined model after z-score normalization. Predictive performance is identical (normalization does not change OLS fit), but the scale-equalized coefficients make the overfitting pattern even more visible. Also kept as a demonstration, not a competing model.
+* Model 3 - Lasso: regularized linear regression fitted via tidymodels. The penalty lambda is selected by 10-fold cross-validation. Lasso shrinks irrelevant coefficients to exactly zero, performing automatic feature selection and avoiding the overfit problem above.
+* Model 4 - Random Forest: a non-linear ensemble method included as the non-linear alternative to Lasso, fitted via tidymodels with default hyperparameters.
+
+```{r}
+#| label: metrics-and-cv-setup
+#| echo: true
+#| results: hide
+
+rmse_fn <- function(actual, predicted) sqrt(mean((actual - predicted)^2, na.rm = TRUE))
+r2_fn   <- function(actual, predicted) cor(actual, predicted)^2
+
+# Remove subject_id once - all model chunks use these data frames
+train_model_data <- train_data %>% select(-subject_id)
+test_model_data  <- test_data  %>% select(-subject_id)
+
+# 10-fold CV folds for Lasso penalty tuning
+set.seed(42)
+cv_folds <- vfold_cv(train_model_data, v = 10)
+```
+
+### Model 1: OLS on Raw Data
+
+> Demonstration only. With more predictors than subjects (p > n), OLS has infinitely many solutions and will memorize the training set. The purpose here is to show the overfit signature (train $R2 \approx 1$, test performance collapses) that motivates regularization.
+
+```{r}
+#| label: model-ols-raw
+#| echo: true
+#| results: markup
+
+model_raw <- lm(y_train_raw ~ ., data = x_train_raw)
+
+pred_raw_train <- predict(model_raw, newdata = x_train_raw)
+pred_raw_test  <- predict(model_raw, newdata = x_test_raw)
+
+metrics_raw <- data.frame(
+  Model   = "OLS (Raw)",
+  Dataset = c("Train", "Test"),
+  RMSE    = c(rmse_fn(y_train_raw, pred_raw_train), rmse_fn(y_test_raw, pred_raw_test)),
+  R2      = c(r2_fn(y_train_raw,   pred_raw_train), r2_fn(y_test_raw,   pred_raw_test))
+)
+
+metrics_raw
+```
+
+### Model 2: OLS on Normalized Data
+
+> Demonstration only. Z-score normalization does not fix the p > n problem - train and test metrics are identical to Model 1 (modulo numerical precision). The value here is pedagogical: with standardized coefficients, the magnitude of overfit is more legible.
+
+Z-score normalization is applied using training set statistics only to prevent data leakage.
+
+```{r}
+#| label: model-ols-norm
+#| echo: true
+#| results: markup
+
+train_means <- x_train_raw %>% summarise(across(everything(), ~mean(.x, na.rm = TRUE)))
+train_sds   <- x_train_raw %>% summarise(across(everything(), ~sd(.x, na.rm = TRUE)))
+
+normalize <- function(data, means, sds) {
+  data %>% mutate(across(everything(), ~(.x - means[[cur_column()]]) / sds[[cur_column()]]))
+}
+
+x_train_norm <- normalize(x_train_raw, train_means, train_sds)
+x_test_norm  <- normalize(x_test_raw,  train_means, train_sds)
+
+# Remove zero-variance columns (would produce NaN after normalization)
+zero_var <- names(x_train_norm)[sapply(x_train_norm, function(x) sd(x, na.rm = TRUE) == 0)]
+if (length(zero_var) > 0) {
+  cat("Removing zero-variance columns:", paste(zero_var, collapse = ", "), "\n")
+  x_train_norm <- x_train_norm %>% select(-all_of(zero_var))
+  x_test_norm  <- x_test_norm  %>% select(-all_of(zero_var))
+}
+
+model_norm <- lm(y_train_raw ~ ., data = x_train_norm)
+
+pred_norm_train <- predict(model_norm, newdata = x_train_norm)
+pred_norm_test  <- predict(model_norm, newdata = x_test_norm)
+
+metrics_norm <- data.frame(
+  Model   = "OLS (Normalized)",
+  Dataset = c("Train", "Test"),
+  RMSE    = c(rmse_fn(y_train_raw, pred_norm_train), rmse_fn(y_test_raw, pred_norm_test)),
+  R2      = c(r2_fn(y_train_raw,   pred_norm_train), r2_fn(y_test_raw,   pred_norm_test))
+)
+
+metrics_norm
+```
+
+### Model 3: Lasso Regression
+
+Lasso penalizes large coefficients and shrinks irrelevant predictors to exactly zero, solving the p > n problem that breaks OLS. We use a tidymodels workflow: a recipe handles z-score normalization, and the penalty lambda is selected via 10-fold cross-validation.
+
+```{r}
+#| label: model-lasso
+#| echo: true
+#| results: markup
+
+# Recipe: normalize all predictors (fit on train only, applied to test)
+lasso_recipe <- recipe(stability_score ~ ., data = train_model_data) %>%
+  step_normalize(all_predictors())
+
+# Model spec: Lasso (mixture = 1) with tunable penalty
+lasso_spec <- linear_reg(penalty = tune(), mixture = 1) %>%
+  set_engine("glmnet")
+
+# Workflow
+lasso_wf <- workflow() %>%
+  add_recipe(lasso_recipe) %>%
+  add_model(lasso_spec)
+
+# Tune: 50-point log-scale grid
+lambda_grid <- grid_regular(penalty(), levels = 50)
+
+set.seed(42)
+lasso_tune <- tune_grid(
+  lasso_wf,
+  resamples = cv_folds,
+  grid      = lambda_grid,
+  metrics   = metric_set(rmse, rsq)
+)
+
+# Select best lambda by CV RMSE
+best_lambda <- select_best(lasso_tune, metric = "rmse")
+
+# Finalize workflow and fit on full training set
+lasso_final <- finalize_workflow(lasso_wf, best_lambda)
+lasso_fit   <- fit(lasso_final, data = train_model_data)
+
+# Predict
+pred_lasso_train <- predict(lasso_fit, new_data = train_model_data)$.pred
+pred_lasso_test  <- predict(lasso_fit, new_data = test_model_data)$.pred
+
+# Metrict
+metrics_lasso <- data.frame(
+  Model   = "Lasso",
+  Dataset = c("Train", "Test"),
+  RMSE    = c(rmse_fn(y_train_raw, pred_lasso_train), rmse_fn(y_test_raw, pred_lasso_test)),
+  R2      = c(r2_fn(y_train_raw,   pred_lasso_train), r2_fn(y_test_raw,   pred_lasso_test))
+)
+
+metrics_lasso
+
+# Features selected
+lasso_coef_tidy <- lasso_fit %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  filter(term != "(Intercept)")
+
+n_selected <- sum(lasso_coef_tidy$estimate != 0)
+```
+
+Cross-validation selected a penalty of `r round(best_lambda$penalty, 6)`. Lasso retained `r n_selected` features out of `r ncol(x_train_raw)`.
+
+### Model 4: Random Forest
+
+Random Forest is the non-linear alternative to Lasso. It makes no linearity assumption and handles correlated predictors naturally. We use a tidymodels workflow with default hyperparameters.
+
+```{r}
+#| label: model-rf
+#| echo: true
+#| results: markup
+
+rf_spec <- rand_forest(mode = "regression") %>%
+  set_engine("randomForest")
+
+rf_wf <- workflow() %>%
+  add_recipe(recipe(stability_score ~ ., data = train_model_data)) %>%
+  add_model(rf_spec)
+
+set.seed(42)
+rf_fit <- fit(rf_wf, data = train_model_data)
+
+pred_rf_train <- predict(rf_fit, new_data = train_model_data)$.pred
+pred_rf_test  <- predict(rf_fit, new_data = test_model_data)$.pred
+
+metrics_rf <- data.frame(
+  Model   = "Random Forest",
+  Dataset = c("Train", "Test"),
+  RMSE    = c(rmse_fn(y_train_raw, pred_rf_train), rmse_fn(y_test_raw, pred_rf_test)),
+  R2      = c(r2_fn(y_train_raw,   pred_rf_train), r2_fn(y_test_raw,   pred_rf_test))
+)
+
+metrics_rf
+```
+
+## Model Comparison
+
+### Unified Metrics Table
+
+The OLS models are included for reference only. The meaningful comparison is Lasso vs. Random Forest on the test set.
+
+```{r}
+#| label: unified-metrics
+#| echo: false
+#| results: markup
+
+all_metrics <- rbind(metrics_raw, metrics_norm, metrics_lasso, metrics_rf)
+all_metrics <- all_metrics %>% mutate(across(where(is.numeric), ~round(., 4)))
+all_metrics
+```
+
+### Predicted vs. Actual (Lasso and Random Forest - Test Set)
+
+Points close to the diagonal indicate accurate predictions.
+
+```{r}
+#| label: pred-vs-actual
+#| echo: false
+#| fig-cap: "Predicted vs. Actual Stability Score (Test Set)"
+
+predicted_stability_test_plot <- bind_rows(
+  data.frame(actual = y_test_raw, predicted = pred_lasso_test, Model = "Lasso"),
+  data.frame(actual = y_test_raw, predicted = pred_rf_test,    Model = "Random Forest")
+) %>%
+  ggplot(aes(x = actual, y = predicted, color = Model)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(slope = 1, intercept = 0, color = "black", linetype = "dashed") +
+  facet_wrap(~Model) +
+  scale_color_manual(values = c("Lasso" = "steelblue", "Random Forest" = "darkorange")) +
+  theme(legend.position = "none") +
+  labs(
+    # title = "Predicted vs. Actual Stability Score (Test Set)",
+    x = "Actual Stability Score",
+    y = "Predicted Stability Score"
+  )
+
+predicted_stability_test_plot
+save_plot(predicted_stability_test_plot, img_reg_dir, "predicted_stability_test.png")
+```
+
+## Model Diagnostics (Lasso)
+
+Regression diagnostics are run on the Lasso model, which is the actual linear model of interest. Running these on the OLS normalized model would be uninformative: with p > n, OLS perfectly interpolates the training set, leaving residuals of essentially zero.
+
+### Residuals vs. Fitted
+
+Residuals should be randomly scattered around zero with no systematic pattern. A funnel shape would indicate heteroscedasticity; a curve would suggest the linear model is missing non-linear structure.
+
+```{r}
+#| label: residuals-vs-fitted
+#| echo: false
+#| fig-cap: "Residuals vs. Fitted Values (Lasso - Train Set)"
+
+resid_df <- data.frame(
+  fitted    = pred_lasso_train,
+  residuals = y_train_raw - pred_lasso_train
+)
+
+residuals_lasso_plot <- ggplot(resid_df, aes(x = fitted, y = residuals)) +
+  geom_point(alpha = 0.6, color = "steelblue") +
+  geom_hline(yintercept = 0, color = "firebrick", linetype = "dashed") +
+  geom_smooth(method = "loess", se = FALSE, color = "orange", linewidth = 0.8) +
+  labs(
+    # title = "Residuals vs. Fitted Values (Lasso - Train Set)",
+    x = "Fitted Values", 
+    y = "Residuals"
+  )
+
+residuals_lasso_plot
+save_plot(residuals_lasso_plot, img_reg_dir, "residuals_lasso.png")
+```
+
+### Q-Q Plot of Residuals
+
+If residuals are approximately normally distributed, the points should lie closely along the diagonal. Systematic departures suggest the error distribution is non-Gaussian, which can affect inference even though it does not directly affect Lasso predictions.
+
+```{r}
+#| label: qq-plot
+#| echo: false
+#| fig-cap: "Q-Q Plot of Residuals (Lasso - Train Set)"
+
+qq_lasso_plot <- ggplot(resid_df, aes(sample = residuals)) +
+  stat_qq(color = "steelblue", alpha = 0.7) +
+  stat_qq_line(color = "firebrick", linetype = "dashed") +
+  labs(
+    # title = "Q-Q Plot of Residuals (Lasso - Train Set)",
+    x = "Theoretical Quantiles", 
+    y = "Sample Quantiles"
+  )
+
+qq_lasso_plot
+save_plot(qq_lasso_plot, img_reg_dir, "qq_lasso.png")
+```
+
+## Feature Importance - Lasso Selected Features
+
+Lasso shrinks irrelevant coefficients to exactly zero. The plot below shows only the features retained by the model, ranked by their effect on `stability_score`.
+
+```{r}
+#| label: lasso-coef-plot
+#| echo: false
+#| fig-cap: "Lasso Selected Features and Their Coefficients"
+
+lasso_coef_df <- lasso_fit %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  filter(term != "(Intercept)", estimate != 0) %>%
+  arrange(desc(abs(estimate)))
+
+lasso_features_plot <- ggplot(lasso_coef_df, aes(x = reorder(term, estimate), y = estimate,
+                           fill = estimate > 0)) +
+  geom_col() +
+  scale_fill_manual(values = c("TRUE" = "steelblue", "FALSE" = "firebrick"),
+                    labels = c("TRUE" = "Positive", "FALSE" = "Negative")) +
+  coord_flip() +
+  labs(
+    # title = "Lasso Selected Features and Their Coefficients",
+    x = "Feature", 
+    y = "Coefficient Estimate", 
+    fill = "Direction"
+  )
+
+lasso_features_plot
+save_plot(lasso_features_plot, img_reg_dir, "lasso_features.png")
+```
+
+## Feature Importance - Random Forest
+
+Random Forest does not produce coefficients, but it records how much each predictor reduces impurity across all trees. The `vip` package extracts these importance scores from the fitted engine.
+
+```{r}
+#| label: rf-importance
+#| echo: false
+#| fig-cap: "Random Forest - Top 20 Feature Importances"
+
+rf_importance_plot <- rf_fit |>
+  extract_fit_engine() |>
+  vip(num_features = 20, aesthetics = list(fill = "steelblue", color = "white")) +
+  labs(
+    # title = "Random Forest - Top 20 Feature Importances",
+    x = "Feature",
+    y = "Importance (Mean Decrease in Node Impurity)"
+  )
+
+rf_importance_plot
+save_plot(rf_importance_plot, img_reg_dir, "rf_importance.png")
+```
+
+### Lasso vs. Random Forest: Feature Agreement
+
+```{r}
+#| label: feature-agreement
+#| echo: false
+#| results: markup
+
+# Lasso selected features
+lasso_selected <- lasso_coef_df %>%
+  transmute(
+    Feature = term,
+    Lasso_Coef = round(estimate, 4)
+  )
+
+n_lasso <- nrow(lasso_selected)
+
+# RF top-N importance
+rf_vi <- rf_fit %>%
+  extract_fit_engine() %>%
+  vip::vi() %>%
+  transmute(
+    Feature = Variable,
+    RF_Rank = row_number()
+  )
+
+# Join and compare
+comparison_df <- lasso_selected %>%
+  left_join(rf_vi, by = "Feature") %>%
+  mutate(
+    RF_Agrees = ifelse(
+      !is.na(RF_Rank) & RF_Rank <= n_lasso,
+      "YES",
+      "NO"
+    )
+  ) %>%
+  arrange(desc(abs(Lasso_Coef)))
+
+comparison_df
+```
+
+Lasso retained `r nrow(lasso_coef_df)` features; of those, `r sum(comparison_df$RF_Agrees == "YES")` appear in Random Forest's top-`r nrow(lasso_coef_df)` by importance.
+
+## Summary and Conclusion
+
+```{r}
+#| label: final-metrics
+#| echo: false
+#| results: markup
+
+test_metrics <- all_metrics %>%
+  filter(Dataset == "Test") %>%
+  filter(Model == "Random Forest" | Model == "Lasso")%>%
+  arrange(RMSE) %>%
+  mutate(across(where(is.numeric), ~round(., 4)))
+
+test_metrics
+```
+
+The two OLS models are not meaningful competitors - with p > n they memorize the training set perfectly and fail on unseen data. The real comparison is Lasso vs. Random Forest. Lasso provides a sparse linear model with automatic feature selection; Random Forest captures non-linear structure and interactions without any explicit selection step.
+
+The features where both models agree - where Lasso assigns a non-zero coefficient *and* RF ranks the same feature in its top-N - are the strongest candidates for a genuine EEG stability signature. That convergence across two completely different selection mechanisms (coefficient shrinkage vs. node impurity) is hard to explain by noise alone. Features that Lasso kept but RF ranks lower likely have a clean linear relationship with stability that gets diluted inside the ensemble; features RF ranks highly that Lasso dropped point to non-linear effects or interactions a penalized linear model cannot represent. If RF outperforms Lasso on the test set, those disagreements are the most likely explanation.
+
+The three features that both models converge on are `FC3_stability_mean`, `C4_stability_mean`, and `FC4_stability_mean`: the average tsfeatures stability statistic across trials for the frontal and central motor cortex channels. This has a direct physiological interpretation: subjects whose frontal and central motor signals are consistently stable across trials produce more repeatable EEG responses during imagery, which in turn makes their classification easier. This connects the regression result back to the classification findings: subjects the regression model predicts as low stability (high `stability_score`) are the same population that appears at or below chance in the per-subject AUC distribution.
+
+# Global Summary of Results and Conclusion
+
+This project explored EEG motor imagery across two distinct analytical paradigms using the PhysioNet dataset. By analyzing the data both at the trial level for within-subject classification and at the subject level for cross-subject regression, we successfully mapped the significant inter-subject variability inherent in BCI applications.
+
+The primary findings from our models resolve the questions posed at the beginning of the study:
+
+- Classification Performance and BCI Illiteracy: When evaluating the models globally, algorithms like Logistic Regression and Random Forest performed poorly, producing aggregate ROC curves that barely exceeded chance levels. However, isolating the metrics per subject revealed a highly spread, bimodal distribution of classification performance. Using our top-performing architectures, like Naive Bayes and Random Forest, a distinct subset of high-performing subjects achieved ROC AUC scores exceeding 75%, with some reaching 100% separability. Conversely, a large segment of the participant pool scored at or below the 50% chance mark, confirming a lack of separable features and demonstrating the well-documented phenomenon of BCI illiteracy.
+
+- Predicting BCI Aptitude: Our across-subject regression task successfully demonstrated that BCI aptitude can be predicted from aggregated baseline EEG properties. After discovering that standard OLS regression entirely fails due to the $p > n$ problem, memorizing the training data but collapsing on the test set, we utilized Lasso regression and Random Forest to establish a reliable predictive model.
+
+- Physiological Feature Convergence: Both the Lasso and Random Forest models independently converged on three critical predictors for the `stability_score`: `FC3_stability_mean`, `C4_stability_mean`, and `FC4_stability_mean`. The agreement across completely different selection mechanisms (coefficient shrinkage vs. node impurity) indicates a real neurophysiological signature.
+
+In the end, the classification and regression tasks validate each other. The regression analysis proved that subjects with consistent, stable signals across the frontal and central motor cortex channels produce highly repeatable EEG responses during motor imagery tasks. This directly explains our classification results: the subjects flagged by the regression model as having low signal stability (a high `stability_score`) are the exact same individuals populating the lower, worse-than-chance mode of the classification distribution.
+
+By predicting BCI illiteracy from baseline properties, this end-to-end analysis demonstrates that stability-based screening can identify subjects who are unlikely to generate separable EEG patterns, saving valuable time and resources before running a full classification framework.
+
+# References

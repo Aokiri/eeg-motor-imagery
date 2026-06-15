@@ -9,3 +9,4 @@ presentation/figures/
 local/
 assets/
 notebooks/*.html
+.quarto
