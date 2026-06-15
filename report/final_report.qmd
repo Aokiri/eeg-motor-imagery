@@ -71,7 +71,7 @@ This report covers an end-to-end neuroimaging machine learning pipeline using th
 1. Classification (Per-Trial Task): Can subject-specific models accurately decode left versus right hand motor imagery from single-trial spectral features extracted from the motor cortex?
 2. Regression (Per-Subject Task): Can an individual's aggregate BCI aptitude (quantified via a composite `stability_score`) be predicted strictly from their resting baseline EEG properties, establishing an intake metric to identify BCI illiteracy prior to task execution?
 
-A major challenge in BCI research is the big variability in neural responses across individuals. Approximately one-third of users fail to generate stable and discriminative motor imagery patterns, a phenomenon commonly referred to as BCI illiteracy. As a result, models trained across subjects often exhibit limited generalization performance. This motivates a dual analytical perspective in which EEG signals are examined both at the trial level for within-subject classification and at the subject level for the study of inter-individual differences in BCI aptitude.
+A major challenge in BCI research is the big variability in neural responses across individuals. Studies estimate that between 15–30% of users fail to generate stable and discriminative motor imagery patterns [@blankertz2010neurophysiological; @ahn2013high], a phenomenon commonly referred to as BCI illiteracy; our dataset reflects a higher prevalence, with roughly half the participant pool performing at or below the chance level. As a result, models trained across subjects often exhibit limited generalization performance. This motivates a dual analytical perspective in which EEG signals are examined both at the trial level for within-subject classification and at the subject level for the study of inter-individual differences in BCI aptitude.
 
 # Data Exploration and Preprocessing
 
@@ -395,7 +395,7 @@ glimpse(trial_features)
 
 ## Band power features
 
-The tsfeatures above operate on the raw broadband signal. For motor imagery, what actually discriminates left from right is the power in two specific frequency bands: mu (8–13 Hz) and beta (13–30 Hz). During imagined movement, power in these bands drops in the motor cortex contralateral to the movement - a phenomenon called event-related desynchronization (ERD). A classifier that cannot see band-specific power is missing the most informative part of the signal.
+The tsfeatures above operate on the raw broadband signal. For motor imagery, what actually discriminates left from right is the power in two specific frequency bands: mu (8–13 Hz) and beta (13–30 Hz). During imagined movement, power in these bands drops in the motor cortex contralateral to the movement — a phenomenon called event-related desynchronization (ERD) [@pfurtscheller1997motor; @pfurtscheller2006mu]. A classifier that cannot see band-specific power is missing the most informative part of the signal.
 
 To extract band power we apply a 4th-order Butterworth bandpass filter and then compute the log-variance of the filtered signal. Log-variance is standard here because it compresses the dynamic range and tends to be more normally distributed than raw variance.
 
@@ -446,6 +446,7 @@ t <- seq(0, length.out = length(c3_signal), by = 1 / 160)
 ```{r}
 #| label: plot-band-power
 #| echo: false
+#| fig-cap: "C3 signal (trial 1, left imagery): broadband versus mu (8–13 Hz) and beta (13–30 Hz) Butterworth-filtered bands. Log-variance of each filtered signal is used as band power."
 
 broadband_vs_filteredbands_plot <- bind_rows(
   tibble(time = t, value = c3_signal, band = "broadband"),
@@ -488,6 +489,8 @@ extract_band_power_features(trial_1_data)
 12 columns: mu and beta power for each of the 6 channels. These get appended to the tsfeatures row for each trial, bringing the total to 100 features per trial.
 
 So far we've only processed S001. Now we need to scale this to all 109 subjects. This will take a while since it's reading 327 EDF files (3 runs x 109 subjects) and computing features for every trial. We save the result to CSV so we only need to run this once.
+
+> **Note on reproducibility:** The preprocessing chunks below are set to `eval: false` to avoid recomputing features on every render, since the results are already saved to `data/processed/`. To reproduce the pipeline from the raw EDF files, set each of these chunks to `eval: true` and re-render the document. Execution will take several minutes.
 
 ```{r}
 #| label: bulk-processing
@@ -1176,7 +1179,7 @@ p_roc_all_models
 save_plot(p_roc_all_models, img_cls_dir, "roc_curves_all_models.png", width = 8, height = 6)
 ```
 
-The aggregate ROC curves trace a path very close to the diagonal (AUC roughly 0.55-0.60). While Logistic Regression and Random Forest show a slight statistical edge globally, the overall performance appears exceptionally weak. However, in BCI literature, reporting pooled metrics is widely considered an bad practice. Because cortical anatomy and cognitive strategy vary radically from person to person, pooling predictions worsens the performance of highly successful, subject-specific models with the output of subjects whose models failed to converge.
+The aggregate ROC curves trace a path very close to the diagonal (AUC roughly 0.55-0.60). While Logistic Regression and Random Forest show a slight statistical edge globally, the overall performance appears exceptionally weak. However, in BCI literature, reporting pooled metrics is widely considered a bad practice. Because cortical anatomy and cognitive strategy vary radically from person to person, pooling predictions worsens the performance of highly successful, subject-specific models with the output of subjects whose models failed to converge.
 
 ## Subject-Level Evaluation
 
@@ -1290,12 +1293,12 @@ p_best_hist <- ggplot(best_per_subject, aes(x = roc_auc)) +
   geom_histogram(binwidth = 0.05, fill = "lightblue", color = "white") +
   geom_vline(
     xintercept = mean(best_per_subject$roc_auc),
-    linetype = "dashed", color = "gray40", linewidth = 0.8
+    linetype = "dashed", color = "steelblue", linewidth = 0.8
   ) +
   geom_vline(
     xintercept = 0.5,
     linetype = "dashed",
-    color = "gray40",
+    color = "red",
     linewidth = 0.8
   ) +
   scale_x_continuous(labels = scales::percent_format()) +
@@ -1308,14 +1311,14 @@ p_best_hist
 save_plot(p_best_hist, img_cls_dir, "best_model_per_subject_rocauc_hist.png", width = 8, height = 5)
 ```
 
-The bar and histogram visualizations show a highly spread, broadly bimodal distribution across the subject pool, confirming the phenomenon of BCI illiteracy:
+The bar and histogram visualizations show a highly spread, broadly bimodal distribution across the subject pool, confirming the phenomenon of BCI illiteracy [@ahn2013high]:
 
 * A distinct part of high-performers forms a distribution mode on the right, successfully exceeding 75% AUC and reaching up to 100%. For these individuals, the Naive Bayes algorithm captures highly separable, robust physiological responses in the feature space.
 * A large segment of low-performers forms a separate mode centered around and well below the 50% chance mark. A substantial portion of the population scores in the 25%–50% test range. This indicates that these subjects lack separable features. As a consequence, models trained on their data either guess randomly or overfit heavily to training noise, leading to worse-than-chance generalization on unseen data.
 
 # Across-Subject Neurophysiological Stability Regression
 
-The classification results show a strongly bimodal distribution of per-subject performance: roughly half the subjects reach above-chance AUC, while the other half stay at or below chance. Given this, a natural follow-up question is whether BCI literacy can be predicted in advance from a subject's aggregated signal properties, without running a full per-subject classifier. If so, a stability-based screening step could identify subjects unlikely to produce a separable EEG signal before investing in a full BCI pipeline. The regression task addresses this question directly.
+The classification results show a strongly bimodal distribution of per-subject performance: roughly half the subjects reach above-chance AUC, while the other half stay at or below chance. Given this, a natural follow-up question is whether BCI literacy can be predicted in advance from a subject's aggregated signal properties, without running a full per-subject classifier [@blankertz2010neurophysiological]. If so, a stability-based screening step could identify subjects unlikely to produce a separable EEG signal before investing in a full BCI pipeline. The regression task addresses this question directly.
 
 ## Setup and Data Loading
 
@@ -1690,14 +1693,17 @@ Random Forest does not produce coefficients, but it records how much each predic
 #| echo: false
 #| fig-cap: "Random Forest - Top 20 Feature Importances"
 
-rf_fit |>
+rf_importance_plot <- rf_fit |>
   extract_fit_engine() |>
   vip(num_features = 20, aesthetics = list(fill = "steelblue", color = "white")) +
   labs(
     # title = "Random Forest - Top 20 Feature Importances",
-    x = "Feature", 
+    x = "Feature",
     y = "Importance (Mean Decrease in Node Impurity)"
   )
+
+rf_importance_plot
+save_plot(rf_importance_plot, img_reg_dir, "rf_importance.png")
 ```
 
 ### Lasso vs. Random Forest: Feature Agreement
@@ -1778,6 +1784,6 @@ The primary findings from our models resolve the questions posed at the beginnin
 
 In the end, the classification and regression tasks validate each other. The regression analysis proved that subjects with consistent, stable signals across the frontal and central motor cortex channels produce highly repeatable EEG responses during motor imagery tasks. This directly explains our classification results: the subjects flagged by the regression model as having low signal stability (a high `stability_score`) are the exact same individuals populating the lower, worse-than-chance mode of the classification distribution.
 
-By predicting BCI illiteracy from baseline properties, this end-to-end analysis demonstrates that stability-based screening can identify subjects who are unlikely to generate separable EEG patterns, saving valuable time and resources before to running a full classification framework.
+By predicting BCI illiteracy from baseline properties, this end-to-end analysis demonstrates that stability-based screening can identify subjects who are unlikely to generate separable EEG patterns, saving valuable time and resources before running a full classification framework.
 
-# Refrences
+# References
