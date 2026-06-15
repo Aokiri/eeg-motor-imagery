@@ -14,6 +14,12 @@ execute:
   message: false
 ---
 
+# Introduction
+
+This report covers an end-to-end EEG analysis using the PhysioNet Motor Movement/Imagery dataset: 109 subjects performing imagined hand movements, recorded at 160 Hz across 64 channels. Two research questions drive the work: first, can we predict left vs. right hand imagery from per-trial EEG features extracted from 6 motor cortex electrodes; second, can we predict a subject's BCI aptitude from their aggregated EEG signal properties.
+
+During motor imagery, power in the mu (8-13 Hz) and beta (13-30 Hz) frequency bands drops in the motor cortex contralateral to the imagined hand, a phenomenon called event-related desynchronization (ERD). Not all subjects produce a reliable ERD signal; those who do not are said to have low BCI literacy. The report is organized in three sections: feature extraction and preprocessing (reading EDF files, segmenting trials, computing the feature set), classification of left vs. right imagery (within-subject models using physiology-backed spectral features), and regression on a composite EEG stability score as a proxy for BCI aptitude.
+
 # Exploring the dataset
 
 We are working with EEG recordings from PhysioNet. 109 subjects, 64 electrodes on the scalp, each doing motor imagery tasks (imagining moving left or right hand).
@@ -709,7 +715,7 @@ all_subjects_features |>
 
 Only S100 had partial data loss (30 out of ~45 trials). Every other subject retained all their trials, that's a very good outcome! Both CSVs are now saved:
 
-* `data/processed/trial_features.csv` — one row per trial (4894 x 100), for classification: 84 tsfeatures + 12 band power features (mu and beta per channel) + 4 metadata columns
+* `data/processed/trial_features.csv` — one row per trial (4894 × 106 columns): 84 tsfeatures + 12 band power features (mu and beta per channel) + 6 lateral asymmetry features + 4 metadata columns (subject_id, trial_id, run, label)
 * `data/processed/subject_features.csv` — one row per subject (109 x 194), for regression: mean + std per feature, n_trials, stability_score
 
 Quick sanity check on the final outputs before wrapping up.
@@ -739,9 +745,9 @@ This notebook covered the full exploration: reading EDF files, understanding the
 
 ## Introduction
 
-This report outlines the binary classification of motor imagery tasks (imagining left vs. right hand movement) using per-trial EEG features. Our dataset consists of 6 core motor-cortex channels equipped with time-series, band-power, and Event-Related Desynchronization (ERD) features.
+This section covers binary classification of motor imagery tasks (imagining left vs. right hand movement) using per-trial EEG features from the 6 motor cortex channels. The feature set uses 30 physiology-backed predictors: band power (mu and beta bands) and event-related desynchronization (ERD) features across the 6 channels (24 features total), plus 6 lateral asymmetry features capturing the left-right band power difference between electrode pairs (C3-C4, FC3-FC4, CP3-CP4). Time-series features from `tsfeatures` are excluded: with roughly 36 training trials per subject, including 84 additional features would produce a dimensionality that makes within-subject models unreliable.
 
-EEG patterns contain extreme inter-subject variance. A significant challenge in this domain is BCI illiteracy - a physiological phenomenon where certain individuals do not produce a high enough signal-to-noise ratio during motor imagery to make the target classes separable. To account for this, our methodology avoids global modeling and relies strictly on a within-subject evaluation pipeline. To maximize predictive performance while minimizing dimensionality, we center our feature space on physiology-backed metrics: $\mu$ and $\beta$ band power, ERD features, and lateral asymmetry between the left and right hemispheres (e.g., C3 vs. C4).
+EEG patterns contain extreme inter-subject variance. A significant challenge in this domain is BCI illiteracy - a physiological phenomenon where certain individuals do not produce a high enough signal-to-noise ratio during motor imagery to make the target classes separable. To account for this, our methodology avoids global modeling and relies strictly on a within-subject evaluation pipeline.
 
 ```{r}
 #| label: setup-classification
@@ -861,7 +867,7 @@ Visually, the distributions for the 'left' and 'right' classes show almost perfe
 ```{r}
 #| label: ks-test
 #| echo: true
-#| results: hide
+#| results: markup
 
 model_df |>
   select(starts_with(c("C3_", "C4_", "C_")), label) |>
@@ -1278,6 +1284,8 @@ The bar and histogram visualizations show a highly spread, broadly bimodal distr
 
 # EEG Stability Score Prediction
 
+The classification results show a strongly bimodal distribution of per-subject performance: roughly half the subjects reach above-chance AUC, while the other half stay at or below chance. Given this, a natural follow-up question is whether BCI literacy can be predicted in advance from a subject's aggregated signal properties, without running a full per-subject classifier. If so, a stability-based screening step could identify subjects unlikely to produce a separable EEG signal before investing in a full BCI pipeline. The regression task addresses this question directly.
+
 ## 1. Setup & Data Loading
 
 ```{r}
@@ -1292,7 +1300,9 @@ library(corrplot)
 library(vip)
 ```
 
-We load the processed subject features and keep only the mean EEG features alongside the target variable `stability_score`. Subjects with any missing values are removed.
+The target variable, `stability_score`, measures trial-to-trial consistency of the EEG signal per subject. It is computed by z-scoring the standard deviation of each tsfeature column across all trials for that subject, then averaging the result: a higher score indicates more variable, less stable neural responses across trials. Band power and ERD standard deviations are excluded from this calculation because, without a rest baseline, their variability conflates task-response differences with noise. The stability score serves as a proxy for BCI aptitude: subjects with stable, consistent signals tend to produce more separable left vs. right patterns for the classifier.
+
+We load the processed subject features and keep only the per-subject mean EEG features alongside `stability_score`. Subjects with any missing values are removed.
 
 ```{r}
 #| label: data-loading
@@ -1739,3 +1749,5 @@ test_metrics
 The two OLS models are not meaningful competitors - with p > n they memorize the training set perfectly and fail on unseen data. The real comparison is Lasso vs. Random Forest. Lasso provides a sparse linear model with automatic feature selection; Random Forest captures non-linear structure and interactions without any explicit selection step.
 
 The features where both models agree - where Lasso assigns a non-zero coefficient *and* RF ranks the same feature in its top-N - are the strongest candidates for a genuine EEG stability signature. That convergence across two completely different selection mechanisms (coefficient shrinkage vs. node impurity) is hard to explain by noise alone. Features that Lasso kept but RF ranks lower likely have a clean linear relationship with stability that gets diluted inside the ensemble; features RF ranks highly that Lasso dropped point to non-linear effects or interactions a penalized linear model cannot represent. If RF outperforms Lasso on the test set, those disagreements are the most likely explanation.
+
+The three features that both models converge on are `FC3_stability_mean`, `C4_stability_mean`, and `FC4_stability_mean`: the average tsfeatures stability statistic across trials for the frontal and central motor cortex channels. This has a direct physiological interpretation: subjects whose frontal and central motor signals are consistently stable across trials produce more repeatable EEG responses during imagery, which in turn makes their classification easier. This connects the regression result back to the classification findings: subjects the regression model predicts as low stability (high `stability_score`) are the same population that appears at or below chance in the per-subject AUC distribution.
